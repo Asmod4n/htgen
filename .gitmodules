@@ -1,0 +1,9 @@
+[submodule "deps/ls-hpack"]
+	path = deps/ls-hpack
+	url = https://github.com/litespeedtech/ls-hpack
+[submodule "deps/picohttpparser"]
+	path = deps/picohttpparser
+	url = https://github.com/h2o/picohttpparser
+[submodule "deps/liburing"]
+	path = deps/liburing
+	url = https://github.com/axboe/liburing
