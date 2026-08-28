@@ -30,24 +30,6 @@ of accept, multishot recv out of a provided buffer ring, send bundles
 where the kernel offers them, one ring enter carrying hundreds of
 completions.
 
-## It is not an oracle
-
-A number from htgen means nothing on its own. It shares its assumptions
-with the servers it was built to measure — the same framing reading, the
-same ring patterns — and a *shared* misunderstanding is exactly the kind
-that does not show up in its own output. Check it against `wrk` or
-`h2load` on the same box before believing it, and against the server's own
-access log before believing the count.
-
-That counting has been checked. Against one such server, comparing
-htgen's tally to the log the server wrote, after a clean shutdown:
-
-| shape | htgen | server log | |
-|---|---|---|---|
-| h1, 8 conns | 371 346 | 371 354 | +8 = in flight at the deadline |
-| h2, 8 conns, 1 stream | 421 069 | 421 076 | +7 |
-| h2, 1 conn, 64 streams | 1 556 160 | 1 556 160 | exact |
-
 ## Options
 
 ```
