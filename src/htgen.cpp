@@ -60,6 +60,9 @@ using namespace htgen;
 constexpr unsigned kBufCountDefault = 2048;
 constexpr unsigned kBufSizeDefault = 4096;
 constexpr unsigned kBufGroup = 1;
+// Where the per-connection SEND groups start - above the one recv group,
+// with room for as many connections as --conns allows.
+constexpr unsigned kSendGroupBase = 16;
 
 // RFC 7541 4.2: SETTINGS_HEADER_TABLE_SIZE has no upper bound in either
 // RFC, and it arrives from the peer - so the ceiling on what our encoder
@@ -79,6 +82,79 @@ constexpr int64_t kWindowTopUp = kH2WindowCeiling / 4;
 constexpr uint32_t kLastClientId = 0x7ffffffd;
 
 enum : uint8_t { kOpRecv = 1, kOpSend = 2 };
+
+// The SEND side's own provided buffer ring, ONE PER CONNECTION - and the
+// reason it cannot be shared: a bundle takes a CONTIGUOUS run of buffer
+// ids from one group for ONE socket (io_uring_prep_send_bundle.3), so
+// two connections filling one ring would send each other's bytes.
+//
+// Requests are written straight in here. Nothing is staged in a buffer
+// of ours first and copied later - filling the ring IS the staging.
+//
+// The order rule this depends on: buffers are added ONLY while no send
+// is in flight. A bundle then grabs everything available, so a short
+// send leaves the ring EMPTY, and the bytes it did not take can be
+// re-added at the tail without overtaking anything.
+struct SendRing {
+  struct io_uring_buf_ring* br = nullptr;
+  char* pool = nullptr;
+  uint16_t count = 0;        // power of two
+  uint32_t size = 0;         // bytes per buffer
+  uint16_t group = 0;
+  int mask = 0;
+
+  // The buffer id is a LABEL; where a buffer sits in the ring is decided
+  // by the producer index. Keeping the two equal - id == position - is
+  // what lets this end know which buffers a completion consumed, because
+  // the kernel reports the id it started at and nothing else.
+  uint16_t head = 0;         // the next buffer the kernel will take
+  uint16_t tail = 0;         // the next buffer we will fill
+  uint16_t queued = 0;       // buffers added and not yet consumed
+  uint32_t open_len = 0;     // bytes written into the buffer at tail
+  bool open_buf = false;     // tail is being filled right now
+  uint32_t len[4096] = {};   // bytes in each buffer, by id
+  char* slot(uint16_t bid) { return pool + static_cast<size_t>(bid) * size; }
+
+  // Close the buffer being filled and hand it to the kernel.
+  void publish() {
+    if (!open_buf) return;
+    len[tail] = open_len;
+    io_uring_buf_ring_add(br, slot(tail), open_len, tail, mask, 0);
+    io_uring_buf_ring_advance(br, 1);
+    tail = static_cast<uint16_t>((tail + 1) & mask);
+    queued++;
+    open_len = 0;
+    open_buf = false;
+  }
+
+  // Room for one more buffer? queued + the open one must stay under the
+  // ring, or we would hand the kernel a buffer it is still reading.
+  bool room() const { return static_cast<uint32_t>(queued) + (open_buf ? 1u : 0u) < count; }
+
+  // One write. Splits across buffers when it has to, which is what makes
+  // a bundle a bundle.
+  void write(const char* p, size_t n) {
+    while (n != 0) {
+      if (!open_buf) {
+        if (!room()) {
+          std::fprintf(stderr, "htgen: send ring full - raise --send-bufs\n");
+          std::exit(1);
+        }
+        open_buf = true;
+        open_len = 0;
+      }
+      const size_t space = size - open_len;
+      const size_t take = n < space ? n : space;
+      std::memcpy(slot(tail) + open_len, p, take);
+      open_len += static_cast<uint32_t>(take);
+      p += take;
+      n -= take;
+      if (open_len == size) publish();
+    }
+  }
+
+  bool pending() const { return queued != 0 || open_buf; }
+};
 
 // A window onto memory somebody else owns, with the three operations the
 // wire paths used a std::string for. There is no allocation here and no
@@ -132,18 +208,18 @@ int64_t now_ns() {
 
 // RFC 9113 4.1: a frame with no payload of its own - SETTINGS ack, and
 // the shape every control frame here is appended in.
-void put_frame(Buf& out, uint32_t len, uint8_t type, uint8_t flags, uint32_t stream) {
+void put_frame(SendRing& out, uint32_t len, uint8_t type, uint8_t flags, uint32_t stream) {
   unsigned char fh[kH2FrameHeaderLen];
   h2_put_frame_header(fh, len, type, flags, stream);
-  out.append(reinterpret_cast<const char*>(fh), sizeof(fh));
+  out.write(reinterpret_cast<const char*>(fh), sizeof(fh));
 }
 
-void put_u32(Buf& out, uint32_t v) {
+void put_u32(SendRing& out, uint32_t v) {
   const unsigned char b[4] = {static_cast<unsigned char>(v >> 24),
                               static_cast<unsigned char>(v >> 16),
                               static_cast<unsigned char>(v >> 8),
                               static_cast<unsigned char>(v)};
-  out.append(reinterpret_cast<const char*>(b), sizeof(b));
+  out.write(reinterpret_cast<const char*>(b), sizeof(b));
 }
 
 // RFC 9113 5/6 and RFC 7541: everything one h2 connection must remember.
@@ -232,9 +308,7 @@ struct Conn {
   bool in_body = false;
   Buf carry;              // only used when a HEAD spans two buffers
   uint64_t done = 0;
-  Buf out;                // queued for the wire, nothing in flight yet
-  Buf wire;               // what the send in flight is reading from
-  size_t sent_at = 0;     // how much of `wire` the kernel has taken
+  SendRing snd;           // requests are written straight into this
   bool sending = false;
   bool queued = false;    // already in Run::to_send this round
   bool dead = false;
@@ -318,20 +392,19 @@ struct Run {
     io_uring_sqe_set_data64(s, tag(kOpRecv, idx));
   }
 
-  // One send in flight per connection: what is queued waits in `out`,
-  // what the kernel is reading sits still in `wire`. Without the split
-  // an append could move the buffer under a send already submitted.
+  // One send in flight per connection, and NOTHING is added to the ring
+  // while it is - that is what makes the re-add on a short send safe.
   void arm_send(uint32_t idx) {
     Conn& c = conns[idx];
-    if (c.dead || c.sending || c.out.empty()) return;
-    c.wire.swap(c.out);
-    c.out.clear();
-    c.sent_at = 0;
+    if (c.dead || c.sending) return;
+    c.snd.publish();
+    if (c.snd.queued == 0) return;
     c.sending = true;
     if (latency && !h2 && c.sent_ns == 0) c.sent_ns = now_ns();
     struct io_uring_sqe* s = sqe();
-    io_uring_prep_send(s, static_cast<int>(idx), c.wire.data(), c.wire.size(), MSG_NOSIGNAL);
-    s->flags |= IOSQE_FIXED_FILE;
+    io_uring_prep_send_bundle(s, static_cast<int>(idx), 0, MSG_NOSIGNAL);
+    s->flags |= IOSQE_BUFFER_SELECT | IOSQE_FIXED_FILE;
+    s->buf_group = c.snd.group;
     io_uring_sqe_set_data64(s, tag(kOpSend, idx));
   }
 
@@ -342,69 +415,74 @@ struct Run {
     to_send.push_back(idx);
   }
 
-  // A short send is lawful; the rest of the buffer goes out from where
-  // the kernel stopped. h1's 40-byte line never saw one, an h2 round of
-  // several frames can.
+  // io_uring_prep_send_bundle.3, and liburing's own test/recvsend_bundle.c
+  // for the part the man page leaves implicit: ONE bundle SQE produces
+  // SEVERAL completions. Each carries its own `res` in bytes and its own
+  // starting buffer id, and IORING_CQE_F_MORE means the operation is not
+  // finished. A buffer leaves the ring only when it has been sent whole,
+  // so there is no half-sent buffer to put back - what the socket had no
+  // room for is simply still in the ring, and the next bundle takes it.
   void on_send(uint32_t idx, struct io_uring_cqe* cqe) {
     Conn& c = conns[idx];
+    SendRing& r = c.snd;
     if (cqe->res <= 0) {
       c.dead = true;
       c.sending = false;
       return;
     }
-    c.sent_at += static_cast<size_t>(cqe->res);
-    if (c.sent_at < c.wire.size()) {
-      struct io_uring_sqe* s = sqe();
-      io_uring_prep_send(s, static_cast<int>(idx), c.wire.data() + c.sent_at,
-                         c.wire.size() - c.sent_at, MSG_NOSIGNAL);
-      s->flags |= IOSQE_FIXED_FILE;
-      io_uring_sqe_set_data64(s, tag(kOpSend, idx));
-      return;
+    size_t sent = static_cast<size_t>(cqe->res);
+    uint16_t bid = static_cast<uint16_t>(cqe->flags >> IORING_CQE_BUFFER_SHIFT);
+    if (bid != r.head) {
+      // The kernel names where it started. Disagreeing about that means
+      // disagreeing about every byte after it, so the run stops here
+      // rather than sending something nobody asked for.
+      std::fprintf(stderr, "htgen: send bundle started at %u, this end had %u\n", bid, r.head);
+      std::exit(1);
     }
-    c.wire.clear();
-    c.sent_at = 0;
+    while (r.queued != 0 && sent >= r.len[bid]) {
+      sent -= r.len[bid];
+      bid = static_cast<uint16_t>((bid + 1) & r.mask);
+      r.queued--;
+    }
+    r.head = bid;
+    if ((cqe->flags & IORING_CQE_F_MORE) != 0) return;  // still running
     c.sending = false;
-    if (!c.out.empty()) queue(idx);
+    if (r.pending()) queue(idx);
   }
 
   // RFC 9112 3: count RESPONSES, not bytes - a head, then exactly the
   // content its Content-Length promised, then the next request goes out.
-  void h1_feed(uint32_t idx, const char* p, size_t n) {
+  //
+  // Parses where the bytes lie and returns how many it consumed. It NEVER
+  // touches the carry: the carry aliasing itself is what the old shape
+  // got wrong - it appended a slice of the carry to the carry and then
+  // recursed into it.
+  size_t h1_parse(uint32_t idx, const char* base, size_t n) {
     Conn& c = conns[idx];
-    while (n != 0) {
+    size_t at = 0;
+    while (at < n) {
       if (c.in_body) {
-        const size_t take = n < c.body_left ? n : c.body_left;
+        const size_t have = n - at;
+        const size_t take = have < c.body_left ? have : c.body_left;
         c.body_left -= take;
-        p += take;
-        n -= take;
+        at += take;
         if (c.body_left == 0) {
           c.in_body = false;
           h1_complete(idx);
         }
         continue;
       }
-      const char* head = p;
-      size_t head_len = n;
-      if (!c.carry.empty()) {
-        c.carry.append(p, n);
-        head = c.carry.data();
-        head_len = c.carry.size();
-      }
       int minor = 0, status = 0;
       const char* msg = nullptr;
       size_t msg_len = 0;
       struct phr_header hdr[64];
       size_t nhdr = sizeof(hdr) / sizeof(hdr[0]);
-      const int r = phr_parse_response(head, head_len, &minor, &status, &msg, &msg_len, hdr,
-                                       &nhdr, 0);
-      if (r == -2) {
-        if (c.carry.empty()) c.carry.assign(p, n);
-        return;
-      }
+      const int r = phr_parse_response(base + at, n - at, &minor, &status, &msg, &msg_len,
+                                       hdr, &nhdr, 0);
+      if (r == -2) break;            // an incomplete head - carry it
       if (r < 0) {
         bad++;
-        c.carry.clear();
-        return;
+        return n;                    // unparseable: drop what is here
       }
       size_t clen = 0;
       for (size_t i = 0; i < nhdr; i++) {
@@ -419,33 +497,34 @@ struct Run {
           }
         }
       }
-      const size_t consumed = static_cast<size_t>(r);
-      const size_t rest = head_len - consumed;
-      c.in_body = true;
-      c.body_left = clen;
-      if (!c.carry.empty()) {
-        // The carry held the split head; what follows it is the content,
-        // and it is still IN the carry - so the recursion reads it there
-        // instead of copying it out first. The carry is only cleared
-        // once that read is done with it.
-        if (rest != 0) {
-          h1_feed(idx, head + consumed, rest);
-          c.carry.clear();
-        } else {
-          c.carry.clear();
-          if (clen == 0) {
-            c.in_body = false;
-            h1_complete(idx);
-          }
-        }
-        return;
-      }
-      p += consumed;
-      n -= consumed;
+      at += static_cast<size_t>(r);
       if (clen == 0) {
-        c.in_body = false;
         h1_complete(idx);
+      } else {
+        c.in_body = true;
+        c.body_left = clen;
       }
+    }
+    return at;
+  }
+
+  // The carry is the ONLY copy this path makes, and only of the bytes
+  // that straddle a buffer boundary.
+  void h1_feed(uint32_t idx, const char* p, size_t n) {
+    Conn& c = conns[idx];
+    if (c.carry.empty()) {
+      const size_t used = h1_parse(idx, p, n);
+      if (used < n) c.carry.assign(p + used, n - used);
+      return;
+    }
+    c.carry.append(p, n);
+    const size_t used = h1_parse(idx, c.carry.data(), c.carry.size());
+    if (used == c.carry.size()) {
+      c.carry.clear();
+    } else if (used != 0) {
+      const size_t rest = c.carry.size() - used;
+      std::memmove(c.carry.data(), c.carry.data() + used, rest);
+      c.carry.len = rest;
     }
   }
 
@@ -457,7 +536,7 @@ struct Run {
       lat.add(now_ns() - c.sent_ns);
       c.sent_ns = now_ns();
     }
-    c.out.append(request);
+    c.snd.write(request.data(), request.size());
     queue(idx);
   }
 
@@ -476,7 +555,7 @@ struct Run {
     c.h2->hdrbuf_cap = 64 * 1024;
     m += 64 * 1024;
     c.h2->hdr_block.bind(m, 1024);
-    c.out.append(kH2Preface, kH2PrefaceLen);
+    c.snd.write(kH2Preface, kH2PrefaceLen);
     // RFC 9113 6.5.1: two settings, six bytes each, spelled on the stack.
     const uint32_t win = static_cast<uint32_t>(kH2WindowCeiling);
     const unsigned char sets[12] = {
@@ -484,10 +563,10 @@ struct Run {
         0, static_cast<unsigned char>(kH2SettingsInitialWindowSize),
         static_cast<unsigned char>(win >> 24), static_cast<unsigned char>(win >> 16),
         static_cast<unsigned char>(win >> 8), static_cast<unsigned char>(win)};
-    put_frame(c.out, sizeof(sets), kH2Settings, 0, 0);
-    c.out.append(reinterpret_cast<const char*>(sets), sizeof(sets));
-    put_frame(c.out, 4, kH2WindowUpdate, 0, 0);
-    put_u32(c.out, static_cast<uint32_t>(kH2WindowCeiling - kH2DefaultWindow));
+    put_frame(c.snd, sizeof(sets), kH2Settings, 0, 0);
+    c.snd.write(reinterpret_cast<const char*>(sets), sizeof(sets));
+    put_frame(c.snd, 4, kH2WindowUpdate, 0, 0);
+    put_u32(c.snd, static_cast<uint32_t>(kH2WindowCeiling - kH2DefaultWindow));
   }
 
   // RFC 9113 8.3: one request is one HEADERS frame - four pseudo-fields,
@@ -506,11 +585,11 @@ struct Run {
       if (latency) c.inflight.emplace_back(id, now_ns());
       const uint8_t hflags =
           body.empty() ? (kH2FlagEndHeaders | kH2FlagEndStream) : kH2FlagEndHeaders;
-      put_frame(c.out, static_cast<uint32_t>(h.hdr_block.size()), kH2Headers, hflags, id);
-      c.out.append(h.hdr_block);
+      put_frame(c.snd, static_cast<uint32_t>(h.hdr_block.size()), kH2Headers, hflags, id);
+      c.snd.write(h.hdr_block.data(), h.hdr_block.size());
       if (!body.empty()) {
-        put_frame(c.out, static_cast<uint32_t>(body.size()), kH2Data, kH2FlagEndStream, id);
-        c.out.append(body.data(), body.size());
+        put_frame(c.snd, static_cast<uint32_t>(body.size()), kH2Data, kH2FlagEndStream, id);
+        c.snd.write(body.data(), body.size());
       }
       h.open++;
       return;
@@ -548,11 +627,11 @@ struct Run {
     } else {
       h.hdr_block.assign(blk, blen);
     }
-    put_frame(c.out, static_cast<uint32_t>(blen), kH2Headers, hflags, id);
-    c.out.append(blk, blen);
+    put_frame(c.snd, static_cast<uint32_t>(blen), kH2Headers, hflags, id);
+    c.snd.write(blk, blen);
     if (!body.empty()) {
-      put_frame(c.out, static_cast<uint32_t>(body.size()), kH2Data, kH2FlagEndStream, id);
-      c.out.append(body.data(), body.size());
+      put_frame(c.snd, static_cast<uint32_t>(body.size()), kH2Data, kH2FlagEndStream, id);
+      c.snd.write(body.data(), body.size());
     }
     h.open++;
   }
@@ -567,7 +646,7 @@ struct Run {
       h2_request(idx);
       if (h.open == before) break;
     }
-    if (!c.out.empty()) queue(idx);
+    if (c.snd.pending()) queue(idx);
   }
 
   void h2_stream_done(uint32_t idx, uint32_t id) {
@@ -635,8 +714,8 @@ struct Run {
     H2Conn& h = *c.h2;
     h.window_used += static_cast<int64_t>(len);
     if (h.window_used < kWindowTopUp) return;
-    put_frame(c.out, 4, kH2WindowUpdate, 0, 0);
-    put_u32(c.out, static_cast<uint32_t>(h.window_used));
+    put_frame(c.snd, 4, kH2WindowUpdate, 0, 0);
+    put_u32(c.snd, static_cast<uint32_t>(h.window_used));
     h.window_used = 0;
     queue(idx);
   }
@@ -716,15 +795,15 @@ struct Run {
           // RFC 9113 6.5.3: every SETTINGS is acknowledged, and the ack
           // itself is never acknowledged.
           if ((flags & kH2FlagAck) == 0) {
-            put_frame(c.out, 0, kH2Settings, kH2FlagAck, 0);
+            put_frame(c.snd, 0, kH2Settings, kH2FlagAck, 0);
             queue(idx);
           }
           break;
         case kH2Ping:
           // RFC 9113 6.7: the same 8 bytes back, with ACK set.
           if ((flags & kH2FlagAck) == 0 && blen == 8) {
-            put_frame(c.out, 8, kH2Ping, kH2FlagAck, 0);
-            c.out.append(reinterpret_cast<const char*>(body_p), 8);
+            put_frame(c.snd, 8, kH2Ping, kH2FlagAck, 0);
+            c.snd.write(reinterpret_cast<const char*>(body_p), 8);
             queue(idx);
           }
           break;
@@ -885,6 +964,7 @@ int main(int argc, char** argv) {
   bool latency = false;
   int bufs = static_cast<int>(kBufCountDefault);
   int buf_size = static_cast<int>(kBufSizeDefault);
+  int send_bufs_arg = 0;
   Span extra_name[32];
   Span extra_val[32];
   size_t nextra = 0;
@@ -908,6 +988,7 @@ int main(int argc, char** argv) {
     else if (std::strcmp(argv[i], "--latency") == 0) latency = true;
     else if (std::strcmp(argv[i], "--bufs") == 0) bufs = std::atoi(next());
     else if (std::strcmp(argv[i], "--buf-size") == 0) buf_size = std::atoi(next());
+    else if (std::strcmp(argv[i], "--send-bufs") == 0) send_bufs_arg = std::atoi(next());
     else if (std::strcmp(argv[i], "--header") == 0) {
       char* h = const_cast<char*>(next());
       if (h == nullptr) { std::fprintf(stderr, "htgen: --header wants NAME:VALUE\n"); return 2; }
@@ -1006,6 +1087,12 @@ int main(int argc, char** argv) {
                          "is what makes the buffer ids wrap\n");
     return 2;
   }
+  if (send_bufs_arg != 0 &&
+      (send_bufs_arg < 8 || send_bufs_arg > 4096 ||
+       (send_bufs_arg & (send_bufs_arg - 1)) != 0)) {
+    std::fprintf(stderr, "htgen: --send-bufs must be a power of two, 8..4096\n");
+    return 2;
+  }
   if (buf_size < 512 || buf_size > (1 << 20)) {
     std::fprintf(stderr, "htgen: --buf-size must be 512..1048576\n");
     return 2;
@@ -1053,8 +1140,16 @@ int main(int argc, char** argv) {
   const size_t frag_cap = 64 * 1024;
   const size_t hdrbuf_cap = 64 * 1024;
   const size_t blk_cap = 1024;
-  const size_t per_conn = 2 * out_cap + (h2 ? carry_cap + frag_cap + hdrbuf_cap + blk_cap
-                                            : carry_cap);
+  // The send ring: enough buffers to hold one round of requests, each
+  // big enough that a request rarely straddles two. Both settable, the
+  // count a power of two because the ring's mask is what wraps the ids.
+  uint16_t send_bufs = 64;
+  const size_t want = h2 ? static_cast<size_t>(streams) : static_cast<size_t>(pipeline);
+  while (send_bufs < want * 2 && send_bufs < 2048) send_bufs = static_cast<uint16_t>(send_bufs * 2);
+  if (send_bufs_arg > 0) send_bufs = static_cast<uint16_t>(send_bufs_arg);
+  const size_t send_buf_size = 4096;
+  const size_t per_conn = static_cast<size_t>(send_bufs) * send_buf_size +
+                          (h2 ? carry_cap + frag_cap + hdrbuf_cap + blk_cap : carry_cap);
   const size_t lat_bytes = latency ? Latency::kBuckets * sizeof(uint64_t) : 0;
   char* block = static_cast<char*>(std::calloc(1, per_conn * static_cast<size_t>(conns) +
                                                   out_cap + lat_bytes));
@@ -1096,8 +1191,11 @@ int main(int argc, char** argv) {
   run.fds.resize(static_cast<size_t>(conns));
   for (int i = 0; i < conns; i++) {
     Conn& cc = run.conns[static_cast<size_t>(i)];
-    cc.out.bind(cursor, out_cap);   cursor += out_cap;
-    cc.wire.bind(cursor, out_cap);  cursor += out_cap;
+    cc.snd.pool = cursor;
+    cc.snd.count = send_bufs;
+    cc.snd.size = static_cast<uint32_t>(send_buf_size);
+    cc.snd.mask = io_uring_buf_ring_mask(send_bufs);
+    cursor += static_cast<size_t>(send_bufs) * send_buf_size;
     if (h2) {
       cc.h2_mem = cursor;
       cursor += carry_cap + frag_cap + hdrbuf_cap + blk_cap;
@@ -1150,6 +1248,21 @@ int main(int argc, char** argv) {
                           static_cast<uint16_t>(i), mask, static_cast<int>(i));
   }
   io_uring_buf_ring_advance(run.br, static_cast<int>(run.buf_count));
+  // ONE SEND RING PER CONNECTION, because a bundle takes a contiguous run
+  // of buffer ids from one group for ONE socket. Group ids start above
+  // the recv group and are the connection index plus that base.
+  for (int i = 0; i < conns; i++) {
+    Conn& cc = run.conns[static_cast<size_t>(i)];
+    cc.snd.group = static_cast<uint16_t>(kSendGroupBase + i);
+    int sbe = 0;
+    cc.snd.br = io_uring_setup_buf_ring(&run.ring, cc.snd.count, cc.snd.group, 0, &sbe);
+    if (cc.snd.br == nullptr) {
+      std::fprintf(stderr, "htgen: setup_buf_ring for connection %d: %s\n", i,
+                   std::strerror(-sbe));
+      return 1;
+    }
+  }
+
   // RFC-free, kernel ABI: one recv completion may carry several buffers
   // instead of one. Needs liburing 2.6 and a kernel that answers with the
   // feature bit; built against an older header the whole idea is absent,
@@ -1158,11 +1271,18 @@ int main(int argc, char** argv) {
   run.bundles = (run.ring.features & IORING_FEAT_RECVSEND_BUNDLE) != 0;
 #else
   run.bundles = false;
-  std::fprintf(stderr, "htgen: built against a liburing without send/recv bundles - "
-                       "one completion per buffer\n");
 #endif
-  if (const char* e = std::getenv("HTGEN_BUNDLE")) {
-    if (e[0] == '0') run.bundles = false;
+  if (!run.bundles) {
+    // No fallback, and that is the design: the send path IS the buffer
+    // ring, and without bundles there is no way to hand the kernel a
+    // run of them. A second implementation to cover an old kernel would
+    // be a second thing to keep true.
+    std::fprintf(stderr,
+                 "htgen: this kernel or liburing has no send/recv bundles "
+                 "(IORING_FEAT_RECVSEND_BUNDLE). htgen needs them: requests are written "
+                 "into a provided buffer ring and sent from it. Needs liburing 2.6+ and "
+                 "a kernel that answers with the feature bit.\n");
+    return 1;
   }
 
   for (int i = 0; i < conns; i++) {
@@ -1175,7 +1295,9 @@ int main(int argc, char** argv) {
       // RFC 9112 9.3.2: pipelining is depth requests on the wire at once.
       // The primer puts `pipeline` of them out; each completion below
       // appends exactly one, so the depth holds for the whole run.
-      for (uint32_t d = 0; d < run.pipeline; d++) run.conns[idx].out.append(run.request);
+      for (uint32_t d = 0; d < run.pipeline; d++) {
+        run.conns[idx].snd.write(run.request.data(), run.request.size());
+      }
     }
     run.conns[idx].queued = false;
     run.arm_send(idx);
