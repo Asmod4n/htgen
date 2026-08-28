@@ -278,6 +278,10 @@ struct Run {
   // reach the same rps with wildly different work, and only this column
   // tells them apart - it is what bench/assets.sh measures.
   uint64_t rx_bytes = 0;
+  // And what went the other way. An upload run pushes gigabytes and
+  // receives a 204: without this the MB/s column describes the answers
+  // and says nothing about the thing being measured.
+  uint64_t tx_bytes = 0;
   // h1 pipelining: how many requests ride one write. 1 = one in flight,
   // which is what every measurement before this defaulted to.
   uint32_t pipeline = 1;
@@ -352,6 +356,7 @@ struct Run {
       c.sending = false;
       return;
     }
+    tx_bytes += static_cast<uint64_t>(cqe->res);
     c.sent_at += static_cast<size_t>(cqe->res);
     if (c.sent_at < c.wire.size()) {
       struct io_uring_sqe* s = sqe();
@@ -1214,7 +1219,7 @@ int main(int argc, char** argv) {
   std::printf(
       "responses=%llu bad=%llu seconds=%.3f rps=%.0f bytes=%llu MB/s=%.2f conns=%d "
       "streams=%d pipeline=%d method=%s proto=%s bundles=%d bufs=%d/%d enobufs=%llu "
-      "rearms=%llu\n",
+      "rearms=%llu tx_bytes=%llu tx_MB/s=%.2f\n",
       static_cast<unsigned long long>(run.responses), static_cast<unsigned long long>(run.bad),
       elapsed, static_cast<double>(run.responses) / elapsed,
       static_cast<unsigned long long>(run.rx_bytes),
@@ -1222,7 +1227,9 @@ int main(int argc, char** argv) {
       method, h2 ? "h2" : "h1",
       run.bundles ? 1 : 0, bufs, buf_size,
       static_cast<unsigned long long>(run.enobufs),
-      static_cast<unsigned long long>(run.rearms));
+      static_cast<unsigned long long>(run.rearms),
+      static_cast<unsigned long long>(run.tx_bytes),
+      static_cast<double>(run.tx_bytes) / elapsed / (1024.0 * 1024.0));
   if (run.latency) {
     // One line, the same shape as the counts: p50 is where half the
     // answers landed, max is the single worst. A percentile that fell
