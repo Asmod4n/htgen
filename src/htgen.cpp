@@ -352,6 +352,10 @@ struct Run {
   // reach the same rps with wildly different work, and only this column
   // tells them apart - it is what bench/assets.sh measures.
   uint64_t rx_bytes = 0;
+  // And what went the other way. An upload run pushes gigabytes and
+  // receives a 204: without this the MB/s column describes the answers
+  // and says nothing about the thing being measured.
+  uint64_t tx_bytes = 0;
   // h1 pipelining: how many requests ride one write. 1 = one in flight,
   // which is what every measurement before this defaulted to.
   uint32_t pipeline = 1;
@@ -430,6 +434,7 @@ struct Run {
       c.sending = false;
       return;
     }
+    tx_bytes += static_cast<uint64_t>(cqe->res);
     size_t sent = static_cast<size_t>(cqe->res);
     uint16_t bid = static_cast<uint16_t>(cqe->flags >> IORING_CQE_BUFFER_SHIFT);
     if (bid != r.head) {
@@ -1143,9 +1148,18 @@ int main(int argc, char** argv) {
   // The send ring: enough buffers to hold one round of requests, each
   // big enough that a request rarely straddles two. Both settable, the
   // count a power of two because the ring's mask is what wraps the ids.
+  // Sized from the BYTES a round puts on the wire, not from the number
+  // of requests in it: a 256 KiB upload is 64 buffers on its own, and a
+  // ring counted in requests is full before the first one is written.
+  const size_t buf_early = 4096;
+  const size_t per_request = 64 + std::strlen(path) + std::strlen(hdr_host) + body.size();
+  const size_t round = (h2 ? static_cast<size_t>(streams) : static_cast<size_t>(pipeline)) *
+                       per_request;
+  const size_t need = (round + buf_early - 1) / buf_early + 2;
   uint16_t send_bufs = 64;
-  const size_t want = h2 ? static_cast<size_t>(streams) : static_cast<size_t>(pipeline);
-  while (send_bufs < want * 2 && send_bufs < 2048) send_bufs = static_cast<uint16_t>(send_bufs * 2);
+  while (static_cast<size_t>(send_bufs) < need * 2 && send_bufs < 4096) {
+    send_bufs = static_cast<uint16_t>(send_bufs * 2);
+  }
   if (send_bufs_arg > 0) send_bufs = static_cast<uint16_t>(send_bufs_arg);
   const size_t send_buf_size = 4096;
   const size_t per_conn = static_cast<size_t>(send_bufs) * send_buf_size +
@@ -1340,7 +1354,7 @@ int main(int argc, char** argv) {
   std::printf(
       "responses=%llu bad=%llu seconds=%.3f rps=%.0f bytes=%llu MB/s=%.2f conns=%d "
       "streams=%d pipeline=%d method=%s proto=%s bundles=%d bufs=%d/%d enobufs=%llu "
-      "rearms=%llu\n",
+      "rearms=%llu tx_bytes=%llu tx_MB/s=%.2f\n",
       static_cast<unsigned long long>(run.responses), static_cast<unsigned long long>(run.bad),
       elapsed, static_cast<double>(run.responses) / elapsed,
       static_cast<unsigned long long>(run.rx_bytes),
@@ -1348,7 +1362,9 @@ int main(int argc, char** argv) {
       method, h2 ? "h2" : "h1",
       run.bundles ? 1 : 0, bufs, buf_size,
       static_cast<unsigned long long>(run.enobufs),
-      static_cast<unsigned long long>(run.rearms));
+      static_cast<unsigned long long>(run.rearms),
+      static_cast<unsigned long long>(run.tx_bytes),
+      static_cast<double>(run.tx_bytes) / elapsed / (1024.0 * 1024.0));
   if (run.latency) {
     // One line, the same shape as the counts: p50 is where half the
     // answers landed, max is the single worst. A percentile that fell
