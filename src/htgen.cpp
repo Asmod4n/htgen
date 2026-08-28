@@ -34,6 +34,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <utility>
 
 #include "liburing.h"
 
@@ -155,6 +156,18 @@ struct Run {
   unsigned replenish = 0;
   uint64_t responses = 0;
   uint64_t bad = 0;
+  // Every byte the kernel handed us, counted where it arrives. A server
+  // that answers 1000 small files and one that answers one large one can
+  // reach the same rps with wildly different work, and only this column
+  // tells them apart - it is what bench/assets.sh measures.
+  uint64_t rx_bytes = 0;
+  // h1 pipelining: how many requests ride one write. 1 = one in flight,
+  // which is what every measurement before this defaulted to.
+  uint32_t pipeline = 1;
+  // Extra request fields, spelled once. h1 keeps them in `request`; h2
+  // encodes them after the pseudo-fields (RFC 9113 8.3: pseudo-fields
+  // come first).
+  std::vector<std::pair<std::string, std::string>> headers;
   std::vector<uint32_t> to_send;
 
   struct io_uring_sqe* sqe() {
@@ -345,7 +358,13 @@ struct Run {
         h2_enc_field(&h.enc, ep, eend, ":scheme", 7, "http", 4) &&
         h2_enc_field(&h.enc, ep, eend, ":authority", 10, authority.data(), authority.size()) &&
         h2_enc_field(&h.enc, ep, eend, ":path", 5, path.data(), path.size());
-    if (!ok) {
+    bool ok_hdrs = ok;
+    for (const auto& hv : headers) {
+      if (!ok_hdrs) break;
+      ok_hdrs = h2_enc_field(&h.enc, ep, eend, hv.first.data(), hv.first.size(),
+                             hv.second.data(), hv.second.size());
+    }
+    if (!ok_hdrs) {
       std::fprintf(stderr, "htgen: the request does not fit one HEADERS frame\n");
       std::exit(1);
     }
@@ -563,6 +582,7 @@ struct Run {
       return;
     }
     if (!(cqe->flags & IORING_CQE_F_BUFFER)) return;
+    rx_bytes += static_cast<uint64_t>(cqe->res);
     uint32_t bid = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
     size_t left = static_cast<size_t>(cqe->res);
     while (left != 0) {
@@ -618,6 +638,8 @@ int main(int argc, char** argv) {
   int port = 0;
   int conns = 64;
   int streams = 1;
+  int pipeline = 1;
+  std::vector<std::pair<std::string, std::string>> extra;
   bool h2 = false;
   double seconds = 5.0;
   for (int i = 1; i < argc; i++) {
@@ -631,6 +653,26 @@ int main(int argc, char** argv) {
     else if (std::strcmp(argv[i], "--host-header") == 0) hdr_host = next();
     else if (std::strcmp(argv[i], "--h2") == 0) h2 = true;
     else if (std::strcmp(argv[i], "--streams") == 0) streams = std::atoi(next());
+    else if (std::strcmp(argv[i], "--pipeline") == 0) pipeline = std::atoi(next());
+    else if (std::strcmp(argv[i], "--header") == 0) {
+      const char* h = next();
+      if (h == nullptr) { std::fprintf(stderr, "htgen: --header wants NAME:VALUE\n"); return 2; }
+      const char* colon = std::strchr(h, ':');
+      if (colon == nullptr || colon == h) {
+        std::fprintf(stderr, "htgen: --header wants NAME:VALUE, got %s\n", h);
+        return 2;
+      }
+      std::string name(h, static_cast<size_t>(colon - h));
+      const char* v = colon + 1;
+      while (*v == ' ' || *v == '\t') v++;
+      // RFC 9113 8.2: h2 field names are lowercase, and ls-hpack indexes
+      // the static table by the lowercase spelling. Done once, here, so
+      // both protocols carry the same field.
+      for (char& c : name) {
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c + 32);
+      }
+      extra.emplace_back(std::move(name), std::string(v));
+    }
     else {
       std::fprintf(stderr, "htgen: unknown argument %s\n", argv[i]);
       return 2;
@@ -648,6 +690,14 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "htgen: --streams must be 1..1024\n");
     return 2;
   }
+  if (pipeline < 1 || pipeline > 1024) {
+    std::fprintf(stderr, "htgen: --pipeline must be 1..1024\n");
+    return 2;
+  }
+  if (h2 && pipeline != 1) {
+    std::fprintf(stderr, "htgen: --pipeline is h1's (RFC 9112 9.3.2); h2 has --streams\n");
+    return 2;
+  }
   if (!h2 && streams != 1) {
     std::fprintf(stderr, "htgen: --streams needs --h2 - h1 has one request in flight\n");
     return 2;
@@ -658,8 +708,13 @@ int main(int argc, char** argv) {
   run.streams = static_cast<uint32_t>(streams);
   run.path = path;
   run.authority = hdr_host;
-  run.request.assign("GET ").append(path).append(" HTTP/1.1\r\nHost: ").append(hdr_host).append(
-      "\r\n\r\n");
+  run.pipeline = static_cast<uint32_t>(pipeline);
+  run.headers = extra;
+  run.request.assign("GET ").append(path).append(" HTTP/1.1\r\nHost: ").append(hdr_host);
+  for (const auto& hv : run.headers) {
+    run.request.append("\r\n").append(hv.first).append(": ").append(hv.second);
+  }
+  run.request.append("\r\n\r\n");
   run.conns.resize(static_cast<size_t>(conns));
   run.fds.resize(static_cast<size_t>(conns));
   for (int i = 0; i < conns; i++) {
@@ -727,7 +782,10 @@ int main(int argc, char** argv) {
       run.h2_open(idx);
       run.h2_fill(idx);
     } else {
-      run.conns[idx].out.append(run.request);
+      // RFC 9112 9.3.2: pipelining is depth requests on the wire at once.
+      // The primer puts `pipeline` of them out; each completion below
+      // appends exactly one, so the depth holds for the whole run.
+      for (uint32_t d = 0; d < run.pipeline; d++) run.conns[idx].out.append(run.request);
     }
     run.conns[idx].queued = false;
     run.arm_send(idx);
@@ -768,9 +826,13 @@ int main(int argc, char** argv) {
   const double elapsed = static_cast<double>(now_ns() - t0) / 1e9;
 
   std::printf(
-      "responses=%llu bad=%llu seconds=%.3f rps=%.0f conns=%d streams=%d proto=%s bundles=%d\n",
+      "responses=%llu bad=%llu seconds=%.3f rps=%.0f bytes=%llu MB/s=%.2f conns=%d "
+      "streams=%d pipeline=%d proto=%s bundles=%d\n",
       static_cast<unsigned long long>(run.responses), static_cast<unsigned long long>(run.bad),
-      elapsed, static_cast<double>(run.responses) / elapsed, conns, streams, h2 ? "h2" : "h1",
+      elapsed, static_cast<double>(run.responses) / elapsed,
+      static_cast<unsigned long long>(run.rx_bytes),
+      static_cast<double>(run.rx_bytes) / elapsed / (1024.0 * 1024.0), conns, streams, pipeline,
+      h2 ? "h2" : "h1",
       run.bundles ? 1 : 0);
   return 0;
 }

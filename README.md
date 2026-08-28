@@ -40,13 +40,29 @@ enter carrying hundreds of completions.
 --host-header H       the Host header, and h2's :authority (default localhost)
 --h2                  speak HTTP/2 with prior knowledge (RFC 9113 3.4)
 --streams M           concurrent streams per connection, --h2 only (default 1)
+--pipeline D          h1 requests in flight per connection (RFC 9112
+                      9.3.2), h1 only (default 1)
+--header NAME:VALUE   an extra request field, repeatable. Names are
+                      lowercased, because RFC 9113 8.2 requires it of h2
+                      and HPACK indexes the static table by that
+                      spelling - so both protocols carry the same field.
 ```
+
+`--header` is what makes a run resemble a browser rather than a probe:
+`Accept`, `Accept-Encoding` and `Accept-Language` are the fields a real
+client sends, and a server may take a completely different path when
+they are present.
 
 One line of counts comes back:
 
 ```
-responses=1173751 bad=0 seconds=3.000 rps=391249 conns=32 streams=1 proto=h1 bundles=1
+responses=1173751 bad=0 seconds=3.000 rps=391249 bytes=210075179 MB/s=66.78 conns=32 streams=1 pipeline=1 proto=h1 bundles=1
 ```
+
+`bytes` is every byte the kernel handed back, and `MB/s` is that over
+the run. Two servers can reach the same rps while moving very different
+amounts of data - a thousand small answers against one large one - and
+this is the column that tells them apart.
 
 `bad` counts what a load generator must never quietly absorb: a non-2xx
 answer, a refused stream, an unparseable response, an HPACK decoder that
