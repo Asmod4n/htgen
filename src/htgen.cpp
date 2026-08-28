@@ -369,42 +369,37 @@ struct Run {
 
   // RFC 9112 3: count RESPONSES, not bytes - a head, then exactly the
   // content its Content-Length promised, then the next request goes out.
-  void h1_feed(uint32_t idx, const char* p, size_t n) {
+  //
+  // Parses where the bytes lie and returns how many it consumed. It NEVER
+  // touches the carry: the carry aliasing itself is what the old shape
+  // got wrong - it appended a slice of the carry to the carry and then
+  // recursed into it.
+  size_t h1_parse(uint32_t idx, const char* base, size_t n) {
     Conn& c = conns[idx];
-    while (n != 0) {
+    size_t at = 0;
+    while (at < n) {
       if (c.in_body) {
-        const size_t take = n < c.body_left ? n : c.body_left;
+        const size_t have = n - at;
+        const size_t take = have < c.body_left ? have : c.body_left;
         c.body_left -= take;
-        p += take;
-        n -= take;
+        at += take;
         if (c.body_left == 0) {
           c.in_body = false;
           h1_complete(idx);
         }
         continue;
       }
-      const char* head = p;
-      size_t head_len = n;
-      if (!c.carry.empty()) {
-        c.carry.append(p, n);
-        head = c.carry.data();
-        head_len = c.carry.size();
-      }
       int minor = 0, status = 0;
       const char* msg = nullptr;
       size_t msg_len = 0;
       struct phr_header hdr[64];
       size_t nhdr = sizeof(hdr) / sizeof(hdr[0]);
-      const int r = phr_parse_response(head, head_len, &minor, &status, &msg, &msg_len, hdr,
-                                       &nhdr, 0);
-      if (r == -2) {
-        if (c.carry.empty()) c.carry.assign(p, n);
-        return;
-      }
+      const int r = phr_parse_response(base + at, n - at, &minor, &status, &msg, &msg_len,
+                                       hdr, &nhdr, 0);
+      if (r == -2) break;            // an incomplete head - carry it
       if (r < 0) {
         bad++;
-        c.carry.clear();
-        return;
+        return n;                    // unparseable: drop what is here
       }
       size_t clen = 0;
       for (size_t i = 0; i < nhdr; i++) {
@@ -419,33 +414,34 @@ struct Run {
           }
         }
       }
-      const size_t consumed = static_cast<size_t>(r);
-      const size_t rest = head_len - consumed;
-      c.in_body = true;
-      c.body_left = clen;
-      if (!c.carry.empty()) {
-        // The carry held the split head; what follows it is the content,
-        // and it is still IN the carry - so the recursion reads it there
-        // instead of copying it out first. The carry is only cleared
-        // once that read is done with it.
-        if (rest != 0) {
-          h1_feed(idx, head + consumed, rest);
-          c.carry.clear();
-        } else {
-          c.carry.clear();
-          if (clen == 0) {
-            c.in_body = false;
-            h1_complete(idx);
-          }
-        }
-        return;
-      }
-      p += consumed;
-      n -= consumed;
+      at += static_cast<size_t>(r);
       if (clen == 0) {
-        c.in_body = false;
         h1_complete(idx);
+      } else {
+        c.in_body = true;
+        c.body_left = clen;
       }
+    }
+    return at;
+  }
+
+  // The carry is the ONLY copy this path makes, and only of the bytes
+  // that straddle a buffer boundary.
+  void h1_feed(uint32_t idx, const char* p, size_t n) {
+    Conn& c = conns[idx];
+    if (c.carry.empty()) {
+      const size_t used = h1_parse(idx, p, n);
+      if (used < n) c.carry.assign(p + used, n - used);
+      return;
+    }
+    c.carry.append(p, n);
+    const size_t used = h1_parse(idx, c.carry.data(), c.carry.size());
+    if (used == c.carry.size()) {
+      c.carry.clear();
+    } else if (used != 0) {
+      const size_t rest = c.carry.size() - used;
+      std::memmove(c.carry.data(), c.carry.data() + used, rest);
+      c.carry.len = rest;
     }
   }
 
