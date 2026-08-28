@@ -60,6 +60,11 @@ using namespace htgen;
 constexpr unsigned kBufCountDefault = 2048;
 constexpr unsigned kBufSizeDefault = 4096;
 constexpr unsigned kBufGroup = 1;
+
+// RFC 7541 4.2: SETTINGS_HEADER_TABLE_SIZE has no upper bound in either
+// RFC, and it arrives from the peer - so the ceiling on what our encoder
+// will allocate for it is ours to set.
+constexpr uint32_t kEncTableMax = 65536;
 constexpr unsigned kSqEntries = 16384;
 
 // RFC 9113 6.9: the client's own receive window. Opened once to the
@@ -112,6 +117,13 @@ struct H2Conn {
   std::string frag;        // RFC 9113 6.10: a block across CONTINUATIONs
   bool frag_end_stream = false;
   std::vector<char> hdrbuf;
+  // The four pseudo-fields do not change within a run, so the block they
+  // encode to stops changing as soon as ls-hpack has them in its dynamic
+  // table: from then on it emits indexed references and the bytes repeat.
+  // Kept and re-emitted with a fresh stream id, the way the SERVER keeps
+  // its answer head instead of encoding it again per request.
+  std::string hdr_block;
+  bool hdr_frozen = false;
   uint32_t next_id = 1;
   uint32_t open = 0;       // streams in flight
   int64_t window_used = 0; // DATA counted against the connection window
@@ -418,6 +430,21 @@ struct Run {
       h.done = true;
       return;
     }
+    if (h.hdr_frozen) {
+      const uint32_t id = h.next_id;
+      h.next_id += 2;
+      if (latency) c.inflight.emplace_back(id, now_ns());
+      const uint8_t hflags =
+          body.empty() ? (kH2FlagEndHeaders | kH2FlagEndStream) : kH2FlagEndHeaders;
+      put_frame(c.out, static_cast<uint32_t>(h.hdr_block.size()), kH2Headers, hflags, id);
+      c.out.append(h.hdr_block);
+      if (!body.empty()) {
+        put_frame(c.out, static_cast<uint32_t>(body.size()), kH2Data, kH2FlagEndStream, id);
+        c.out.append(body);
+      }
+      h.open++;
+      return;
+    }
     unsigned char buf[1024];
     unsigned char* ep = buf;
     unsigned char* const eend = buf + sizeof(buf);
@@ -443,8 +470,17 @@ struct Run {
     // END_STREAM moves to the last DATA frame when there is content.
     const uint8_t hflags =
         body.empty() ? (kH2FlagEndHeaders | kH2FlagEndStream) : kH2FlagEndHeaders;
-    put_frame(c.out, static_cast<uint32_t>(ep - buf), kH2Headers, hflags, id);
-    c.out.append(reinterpret_cast<const char*>(buf), static_cast<size_t>(ep - buf));
+    // Two encodings that agree mean the encoder's table has settled -
+    // everything after this is the same bytes, so they are kept.
+    const char* blk = reinterpret_cast<const char*>(buf);
+    const size_t blen = static_cast<size_t>(ep - buf);
+    if (h.hdr_block.size() == blen && std::memcmp(h.hdr_block.data(), blk, blen) == 0) {
+      h.hdr_frozen = true;
+    } else {
+      h.hdr_block.assign(blk, blen);
+    }
+    put_frame(c.out, static_cast<uint32_t>(blen), kH2Headers, hflags, id);
+    c.out.append(blk, blen);
     if (!body.empty()) {
       put_frame(c.out, static_cast<uint32_t>(body.size()), kH2Data, kH2FlagEndStream, id);
       c.out.append(body);
@@ -580,8 +616,25 @@ struct Run {
 
       switch (type) {
         case kH2Settings:
-          // RFC 9113 6.5.3: every SETTINGS is acknowledged, and the ack
-          // itself is never acknowledged.
+          // RFC 9113 6.5.2 / RFC 7541 4.2: the peer says how large a
+          // dynamic table ITS decoder keeps, which is the ceiling for
+          // OUR encoder - and a peer that says 0 forbids the table
+          // outright, so the kept block would be wrong from then on.
+          // Read rather than only acknowledged.
+          if ((flags & kH2FlagAck) == 0 && blen % 6 == 0) {
+            for (size_t e = 0; e + 6 <= blen; e += 6) {
+              const uint16_t sid_key =
+                  static_cast<uint16_t>((body[e] << 8) | body[e + 1]);
+              if (sid_key != kH2SettingsHeaderTableSize) continue;
+              uint32_t v = 0;
+              for (int b = 0; b < 4; b++) v = (v << 8) | body[e + 2 + b];
+              // Clamped: the number is the peer's, the allocation is
+              // ours. Encoding with a smaller table is always legal.
+              lshpack_enc_set_max_capacity(&h.enc, v > kEncTableMax ? kEncTableMax : v);
+              h.hdr_frozen = false;
+              h.hdr_block.clear();
+            }
+          }
           if ((flags & kH2FlagAck) == 0) {
             put_frame(c.out, 0, kH2Settings, kH2FlagAck, 0);
             queue(idx);
