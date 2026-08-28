@@ -1,7 +1,13 @@
 # htgen - one binary, three C/C++ files and two submodules.
 #
 #   make            build ./htgen
+#   make install    copy it to $(BINDIR) (default /usr/local/bin)
+#   make uninstall
 #   make clean
+#
+# PREFIX/DESTDIR follow the usual convention, so a packager can stage it:
+#   make install PREFIX=$HOME/.local
+#   make install DESTDIR=/tmp/stage PREFIX=/usr
 #
 # Every dependency is a submodule:
 #   git submodule update --init --recursive
@@ -34,6 +40,11 @@ URING_CFLAGS := -I$(URING)/src/include
 URING_LIBS   := $(URING)/src/liburing.a
 URING_DEP    := $(URING)/src/liburing.a
 endif
+
+PREFIX  ?= /usr/local
+BINDIR  ?= $(PREFIX)/bin
+DESTDIR ?=
+INSTALL ?= install
 
 OBJS := build/htgen.o build/lshpack.o build/xxhash.o build/picohttpparser.o
 
@@ -68,8 +79,17 @@ $(HPACK)/lshpack.h:
 	@echo "deps/ls-hpack is empty - run: git submodule update --init --recursive" >&2
 	@false
 
+# One binary and nothing else - no libraries, no data files, no man page
+# yet. -D makes the directory, so a staged PREFIX needs no mkdir first.
+install: htgen
+	$(INSTALL) -d $(DESTDIR)$(BINDIR)
+	$(INSTALL) -m 755 htgen $(DESTDIR)$(BINDIR)/htgen
+
+uninstall:
+	rm -f $(DESTDIR)$(BINDIR)/htgen
+
 clean:
 	rm -rf build htgen
 	-$(MAKE) -s -C $(URING) clean 2>/dev/null
 
-.PHONY: clean
+.PHONY: clean install uninstall

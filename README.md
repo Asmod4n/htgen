@@ -33,6 +33,13 @@ enter carrying hundreds of completions.
 
 ## Options
 
+Install it if you would rather not type a path:
+
+```
+make install                      # /usr/local/bin/htgen
+make install PREFIX=$HOME/.local  # ~/.local/bin/htgen
+```
+
 ```
 --host H --port P     where to connect, TCP
 --sock PATH           ... or an AF_UNIX socket, instead of host/port
