@@ -126,6 +126,43 @@ struct H2Conn {
 
 // One connection: what it still owes of the response it is reading, what
 // it still owes the wire, and - for h2 - the frame state above.
+// RFC-free, and deliberately not a sorted sample vector: at a few
+// million answers a second, keeping every latency would cost more RAM
+// than the run. One bucket per microsecond up to 65 ms covers every
+// answer a local server gives; what lands beyond it is counted apart
+// and SAID, never folded into a percentile that would then be a guess.
+struct Latency {
+  static constexpr uint32_t kBuckets = 1u << 16;  // 0..65535 us
+  std::vector<uint64_t> us;
+  uint64_t over = 0;
+  uint64_t n = 0;
+  uint64_t max_us = 0;
+
+  Latency() : us(kBuckets, 0) {}
+
+  void add(int64_t ns) {
+    const uint64_t v = static_cast<uint64_t>(ns < 0 ? 0 : ns) / 1000;
+    n++;
+    if (v > max_us) max_us = v;
+    if (v >= kBuckets) { over++; return; }
+    us[v]++;
+  }
+
+  // The rank-th sample, counted from the low end. Returns kBuckets when
+  // the rank falls into the overflow, so the caller can say ">65ms"
+  // instead of printing the cap as if it were the answer.
+  uint64_t quantile(double q) const {
+    if (n == 0) return 0;
+    const uint64_t want = static_cast<uint64_t>(q * static_cast<double>(n));
+    uint64_t seen = 0;
+    for (uint32_t i = 0; i < kBuckets; i++) {
+      seen += us[i];
+      if (seen > want) return i;
+    }
+    return kBuckets;
+  }
+};
+
 struct Conn {
   int fd = -1;
   size_t body_left = 0;   // RFC 9110 8.6: content still to arrive
@@ -138,6 +175,12 @@ struct Conn {
   bool sending = false;
   bool queued = false;    // already in Run::to_send this round
   bool dead = false;
+  // --latency only. h1 carries one timestamp because one request is in
+  // flight; h2 carries one per open stream, because they finish in any
+  // order and a shared timestamp would be the batch's, not the
+  // request's.
+  int64_t sent_ns = 0;
+  std::vector<std::pair<uint32_t, int64_t>> inflight;
   std::unique_ptr<H2Conn> h2;
 };
 
@@ -168,6 +211,12 @@ struct Run {
   // encodes them after the pseudo-fields (RFC 9113 8.3: pseudo-fields
   // come first).
   std::vector<std::pair<std::string, std::string>> headers;
+  // RFC 9110 9: the method, and the content a request carries. GET with
+  // no content is the default and the only shape htgen had.
+  std::string method = "GET";
+  std::string body;
+  bool latency = false;
+  Latency lat;
   std::vector<uint32_t> to_send;
 
   struct io_uring_sqe* sqe() {
@@ -203,6 +252,7 @@ struct Run {
     c.out.clear();
     c.sent_at = 0;
     c.sending = true;
+    if (latency && !h2 && c.sent_ns == 0) c.sent_ns = now_ns();
     struct io_uring_sqe* s = sqe();
     io_uring_prep_send(s, static_cast<int>(idx), c.wire.data(), c.wire.size(), MSG_NOSIGNAL);
     s->flags |= IOSQE_FIXED_FILE;
@@ -316,6 +366,10 @@ struct Run {
     Conn& c = conns[idx];
     c.done++;
     responses++;
+    if (latency) {
+      lat.add(now_ns() - c.sent_ns);
+      c.sent_ns = now_ns();
+    }
     c.out.append(request);
     queue(idx);
   }
@@ -354,7 +408,7 @@ struct Run {
     unsigned char* ep = buf;
     unsigned char* const eend = buf + sizeof(buf);
     const bool ok =
-        h2_enc_field(&h.enc, ep, eend, ":method", 7, "GET", 3) &&
+        h2_enc_field(&h.enc, ep, eend, ":method", 7, method.data(), method.size()) &&
         h2_enc_field(&h.enc, ep, eend, ":scheme", 7, "http", 4) &&
         h2_enc_field(&h.enc, ep, eend, ":authority", 10, authority.data(), authority.size()) &&
         h2_enc_field(&h.enc, ep, eend, ":path", 5, path.data(), path.size());
@@ -370,9 +424,17 @@ struct Run {
     }
     const uint32_t id = h.next_id;
     h.next_id += 2;
-    put_frame(c.out, static_cast<uint32_t>(ep - buf), kH2Headers,
-              kH2FlagEndHeaders | kH2FlagEndStream, id);
+    if (latency) c.inflight.emplace_back(id, now_ns());
+    // RFC 9113 8.1: content rides in DATA after the HEADERS, so
+    // END_STREAM moves to the last DATA frame when there is content.
+    const uint8_t hflags =
+        body.empty() ? (kH2FlagEndHeaders | kH2FlagEndStream) : kH2FlagEndHeaders;
+    put_frame(c.out, static_cast<uint32_t>(ep - buf), kH2Headers, hflags, id);
     c.out.append(reinterpret_cast<const char*>(buf), static_cast<size_t>(ep - buf));
+    if (!body.empty()) {
+      put_frame(c.out, static_cast<uint32_t>(body.size()), kH2Data, kH2FlagEndStream, id);
+      c.out.append(body);
+    }
     h.open++;
   }
 
@@ -389,11 +451,22 @@ struct Run {
     if (!c.out.empty()) queue(idx);
   }
 
-  void h2_stream_done(uint32_t idx) {
+  void h2_stream_done(uint32_t idx, uint32_t id) {
     Conn& c = conns[idx];
     c.h2->open--;
     c.done++;
     responses++;
+    if (latency) {
+      // Usually the front - streams normally finish in the order they
+      // were opened - so the scan is one step, and never longer than
+      // the number of streams in flight.
+      for (size_t i = 0; i < c.inflight.size(); i++) {
+        if (c.inflight[i].first != id) continue;
+        lat.add(now_ns() - c.inflight[i].second);
+        c.inflight.erase(c.inflight.begin() + static_cast<long>(i));
+        break;
+      }
+    }
     h2_fill(idx);
   }
 
@@ -516,7 +589,7 @@ struct Run {
                        h.frag.size());
             h.frag.clear();
             if (h.done) return;
-            if (h.frag_end_stream) h2_stream_done(idx);
+            if (h.frag_end_stream) h2_stream_done(idx, sid);
           }
           break;
         case kH2Continuation:
@@ -526,12 +599,12 @@ struct Run {
                        h.frag.size());
             h.frag.clear();
             if (h.done) return;
-            if (h.frag_end_stream) h2_stream_done(idx);
+            if (h.frag_end_stream) h2_stream_done(idx, sid);
           }
           break;
         case kH2Data:
           h2_credit(idx, len);
-          if ((flags & kH2FlagEndStream) != 0) h2_stream_done(idx);
+          if ((flags & kH2FlagEndStream) != 0) h2_stream_done(idx, sid);
           break;
         case kH2RstStream:
           // RFC 9113 6.4: the stream is gone; the connection carries on.
@@ -639,6 +712,10 @@ int main(int argc, char** argv) {
   int conns = 64;
   int streams = 1;
   int pipeline = 1;
+  const char* method = "GET";
+  const char* body_arg = nullptr;
+  const char* body_file = nullptr;
+  bool latency = false;
   std::vector<std::pair<std::string, std::string>> extra;
   bool h2 = false;
   double seconds = 5.0;
@@ -654,6 +731,10 @@ int main(int argc, char** argv) {
     else if (std::strcmp(argv[i], "--h2") == 0) h2 = true;
     else if (std::strcmp(argv[i], "--streams") == 0) streams = std::atoi(next());
     else if (std::strcmp(argv[i], "--pipeline") == 0) pipeline = std::atoi(next());
+    else if (std::strcmp(argv[i], "--method") == 0) method = next();
+    else if (std::strcmp(argv[i], "--body") == 0) body_arg = next();
+    else if (std::strcmp(argv[i], "--body-file") == 0) body_file = next();
+    else if (std::strcmp(argv[i], "--latency") == 0) latency = true;
     else if (std::strcmp(argv[i], "--header") == 0) {
       const char* h = next();
       if (h == nullptr) { std::fprintf(stderr, "htgen: --header wants NAME:VALUE\n"); return 2; }
@@ -690,6 +771,46 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "htgen: --streams must be 1..1024\n");
     return 2;
   }
+  if (method == nullptr || method[0] == '\0') {
+    std::fprintf(stderr, "htgen: --method wants a token (RFC 9110 9)\n");
+    return 2;
+  }
+  if (body_arg != nullptr && body_file != nullptr) {
+    std::fprintf(stderr, "htgen: --body and --body-file name the same thing; pick one\n");
+    return 2;
+  }
+  std::string body;
+  if (body_arg != nullptr) body.assign(body_arg);
+  if (body_file != nullptr) {
+    std::FILE* bf = std::fopen(body_file, "rb");
+    if (bf == nullptr) {
+      std::fprintf(stderr, "htgen: cannot open %s: %s\n", body_file, std::strerror(errno));
+      return 2;
+    }
+    char chunk[8192];
+    size_t got;
+    while ((got = std::fread(chunk, 1, sizeof(chunk), bf)) != 0) body.append(chunk, got);
+    std::fclose(bf);
+  }
+  // RFC 9113 6.9.2: a stream's initial send window is 65535 and this end
+  // never grows it, so content larger than one window would stall
+  // mid-body waiting for a WINDOW_UPDATE this client does not yet
+  // handle. Refused by name rather than half-sent.
+  if (h2 && body.size() > 16384) {
+    std::fprintf(stderr,
+                 "htgen: --body over 16384 bytes needs h2 flow control this client does "
+                 "not do yet (RFC 9113 6.9.2)\n");
+    return 2;
+  }
+  if (latency && pipeline != 1) {
+    // wrk's own bug, not repeated here: with a batch on the wire there
+    // is ONE timestamp for DEPTH answers, so every percentile it prints
+    // is the batch's turnaround divided by nothing.
+    std::fprintf(stderr,
+                 "htgen: --latency needs --pipeline 1 - a batch has one timestamp for all "
+                 "of its answers, and a percentile taken from that is not a latency\n");
+    return 2;
+  }
   if (pipeline < 1 || pipeline > 1024) {
     std::fprintf(stderr, "htgen: --pipeline must be 1..1024\n");
     return 2;
@@ -710,11 +831,22 @@ int main(int argc, char** argv) {
   run.authority = hdr_host;
   run.pipeline = static_cast<uint32_t>(pipeline);
   run.headers = extra;
-  run.request.assign("GET ").append(path).append(" HTTP/1.1\r\nHost: ").append(hdr_host);
+  run.method = method;
+  run.body = body;
+  run.latency = latency;
+  run.request.assign(run.method).append(" ").append(path).append(" HTTP/1.1\r\nHost: ")
+      .append(hdr_host);
   for (const auto& hv : run.headers) {
     run.request.append("\r\n").append(hv.first).append(": ").append(hv.second);
   }
-  run.request.append("\r\n\r\n");
+  // RFC 9110 8.6: content is announced, always - a request without a
+  // Content-Length and without chunked has no content at all, and a
+  // server is right to answer 411 or read the next request out of the
+  // body. Sent even for an empty --body, because "0" is an answer.
+  if (!run.body.empty()) {
+    run.request.append("\r\nContent-Length: ").append(std::to_string(run.body.size()));
+  }
+  run.request.append("\r\n\r\n").append(run.body);
   run.conns.resize(static_cast<size_t>(conns));
   run.fds.resize(static_cast<size_t>(conns));
   for (int i = 0; i < conns; i++) {
@@ -827,12 +959,29 @@ int main(int argc, char** argv) {
 
   std::printf(
       "responses=%llu bad=%llu seconds=%.3f rps=%.0f bytes=%llu MB/s=%.2f conns=%d "
-      "streams=%d pipeline=%d proto=%s bundles=%d\n",
+      "streams=%d pipeline=%d method=%s proto=%s bundles=%d\n",
       static_cast<unsigned long long>(run.responses), static_cast<unsigned long long>(run.bad),
       elapsed, static_cast<double>(run.responses) / elapsed,
       static_cast<unsigned long long>(run.rx_bytes),
       static_cast<double>(run.rx_bytes) / elapsed / (1024.0 * 1024.0), conns, streams, pipeline,
-      h2 ? "h2" : "h1",
+      run.method.c_str(), h2 ? "h2" : "h1",
       run.bundles ? 1 : 0);
+  if (run.latency) {
+    // One line, the same shape as the counts: p50 is where half the
+    // answers landed, max is the single worst. A percentile that fell
+    // past the histogram's 65 ms says so instead of printing the cap.
+    const auto spell = [&](double q) {
+      const uint64_t v = run.lat.quantile(q);
+      static char buf[32];
+      if (v >= Latency::kBuckets) std::snprintf(buf, sizeof(buf), ">65535");
+      else std::snprintf(buf, sizeof(buf), "%llu", static_cast<unsigned long long>(v));
+      return std::string(buf);
+    };
+    std::printf("latency_us p50=%s p90=%s p99=%s p999=%s max=%llu over65ms=%llu n=%llu\n",
+                spell(0.50).c_str(), spell(0.90).c_str(), spell(0.99).c_str(),
+                spell(0.999).c_str(), static_cast<unsigned long long>(run.lat.max_us),
+                static_cast<unsigned long long>(run.lat.over),
+                static_cast<unsigned long long>(run.lat.n));
+  }
   return 0;
 }
