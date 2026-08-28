@@ -28,8 +28,17 @@ against `h2load` (nghttp2), which is what the numbers below compare:
 | 64 streams | 631 573 rps | 2 109 802 rps |
 
 htgen is built the way a modern server is: multishot recv out of a
-provided buffer ring, send bundles where the kernel offers them, one ring
-enter carrying hundreds of completions.
+provided buffer ring, `IORING_RECVSEND_BUNDLE` on that recv where the
+kernel offers it, one ring enter carrying hundreds of completions.
+
+The SEND side does not use bundles, and the reason is that it has
+nothing to gain from them: a bundle exists to let one operation consume
+several queued buffers, and htgen already concatenates a connection's
+whole round into one buffer in user space, so the send is one SQE
+either way. Using the kernel's mechanism instead would mean a provided
+buffer ring per connection - a bundle takes a CONTIGUOUS run of buffer
+ids for ONE socket, and connections interleave - which is a lot of
+machinery to arrive at the same syscall count.
 
 ## Options
 
@@ -64,6 +73,16 @@ make install PREFIX=$HOME/.local  # ~/.local/bin/htgen
                       window this client would need WINDOW_UPDATE
                       handling it does not have yet, and it says so
                       rather than stalling mid-body.
+--bufs N              buffers in the provided ring, power of two
+                      (default 2048)
+--buf-size N          bytes per buffer (default 4096). Both are here
+                      because an empty ring is the first thing to
+                      suspect when NEITHER end is at its limit: the
+                      kernel answers -ENOBUFS, that connection's recv
+                      has to be armed again, and it sits idle until it
+                      is. `enobufs=` in the result line says whether
+                      that ever happened, so the knob is turned on
+                      evidence rather than on a hunch.
 --latency             also measure per-request latency, and print
                       percentiles. Needs --pipeline 1: with a batch on
                       the wire there is ONE timestamp for every answer
@@ -81,8 +100,13 @@ they are present.
 One line of counts comes back:
 
 ```
-responses=1173751 bad=0 seconds=3.000 rps=391249 bytes=210075179 MB/s=66.78 conns=32 streams=1 pipeline=1 method=GET proto=h1 bundles=1
+responses=1173751 bad=0 seconds=3.000 rps=391249 bytes=210075179 MB/s=66.78 conns=32 streams=1 pipeline=1 method=GET proto=h1 bundles=1 bufs=2048/4096 enobufs=0 rearms=0
 ```
+
+`enobufs` counts the times the buffer ring was empty when an answer
+arrived; `rearms` counts multishot recvs that ended and had to be armed
+again. Both zero is what a healthy run looks like. Either one climbing
+while neither end is at 100% CPU is the explanation for the gap.
 
 With `--latency`, a second line follows:
 

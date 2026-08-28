@@ -51,8 +51,14 @@ using namespace htgen;
 // Ring geometry. 2048 buffers of 4 KiB is enough that a burst of small
 // responses lands in one completion batch without the pool running dry,
 // and small enough to stay in cache.
-constexpr unsigned kBufCount = 2048;
-constexpr unsigned kBufSize = 4096;
+// The provided buffer ring's geometry. Both are SETTABLE (--bufs,
+// --buf-size) because they are the first thing to suspect when neither
+// end is at its limit: an empty ring answers -ENOBUFS, the recv has to
+// be armed again, and that connection sits idle until it is - which
+// looks exactly like a slow peer. The count must stay a power of two;
+// io_uring_buf_ring_mask depends on it.
+constexpr unsigned kBufCountDefault = 2048;
+constexpr unsigned kBufSizeDefault = 4096;
 constexpr unsigned kBufGroup = 1;
 constexpr unsigned kSqEntries = 16384;
 
@@ -188,6 +194,14 @@ struct Run {
   struct io_uring ring {};
   struct io_uring_buf_ring* br = nullptr;
   char* pool = nullptr;
+  unsigned buf_count = kBufCountDefault;
+  unsigned buf_size = kBufSizeDefault;
+  // What the ring running dry costs, counted rather than assumed: one
+  // -ENOBUFS is one connection idle until its recv is armed again.
+  uint64_t enobufs = 0;
+  // A multishot recv that ended and had to be armed again. Normal at
+  // a connection's end, a symptom in the middle of a run.
+  uint64_t rearms = 0;
   std::vector<Conn> conns;
   std::vector<int> fds;
   std::string request;    // h1: the constant line; h2: unused
@@ -649,6 +663,7 @@ struct Run {
   void on_recv(uint32_t idx, struct io_uring_cqe* cqe) {
     if (cqe->res <= 0) {
       if (cqe->res == -ENOBUFS) {
+        enobufs++;
         arm_recv(idx);
         return;
       }
@@ -659,13 +674,16 @@ struct Run {
     uint32_t bid = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
     size_t left = static_cast<size_t>(cqe->res);
     while (left != 0) {
-      const size_t take = left < kBufSize ? left : kBufSize;
-      feed(idx, pool + static_cast<size_t>(bid) * kBufSize, take);
+      const size_t take = left < buf_size ? left : buf_size;
+      feed(idx, pool + static_cast<size_t>(bid) * buf_size, take);
       left -= take;
-      bid = (bid + 1) & (kBufCount - 1);
+      bid = (bid + 1) & (buf_count - 1);
       replenish++;
     }
-    if (!(cqe->flags & IORING_CQE_F_MORE)) arm_recv(idx);
+    if (!(cqe->flags & IORING_CQE_F_MORE)) {
+      rearms++;
+      arm_recv(idx);
+    }
   }
 };
 
@@ -716,6 +734,8 @@ int main(int argc, char** argv) {
   const char* body_arg = nullptr;
   const char* body_file = nullptr;
   bool latency = false;
+  int bufs = static_cast<int>(kBufCountDefault);
+  int buf_size = static_cast<int>(kBufSizeDefault);
   std::vector<std::pair<std::string, std::string>> extra;
   bool h2 = false;
   double seconds = 5.0;
@@ -735,6 +755,8 @@ int main(int argc, char** argv) {
     else if (std::strcmp(argv[i], "--body") == 0) body_arg = next();
     else if (std::strcmp(argv[i], "--body-file") == 0) body_file = next();
     else if (std::strcmp(argv[i], "--latency") == 0) latency = true;
+    else if (std::strcmp(argv[i], "--bufs") == 0) bufs = std::atoi(next());
+    else if (std::strcmp(argv[i], "--buf-size") == 0) buf_size = std::atoi(next());
     else if (std::strcmp(argv[i], "--header") == 0) {
       const char* h = next();
       if (h == nullptr) { std::fprintf(stderr, "htgen: --header wants NAME:VALUE\n"); return 2; }
@@ -811,6 +833,15 @@ int main(int argc, char** argv) {
                  "of its answers, and a percentile taken from that is not a latency\n");
     return 2;
   }
+  if (bufs < 8 || bufs > (1 << 20) || (bufs & (bufs - 1)) != 0) {
+    std::fprintf(stderr, "htgen: --bufs must be a power of two, 8..1048576 - the ring's mask "
+                         "is what makes the buffer ids wrap\n");
+    return 2;
+  }
+  if (buf_size < 512 || buf_size > (1 << 20)) {
+    std::fprintf(stderr, "htgen: --buf-size must be 512..1048576\n");
+    return 2;
+  }
   if (pipeline < 1 || pipeline > 1024) {
     std::fprintf(stderr, "htgen: --pipeline must be 1..1024\n");
     return 2;
@@ -834,6 +865,8 @@ int main(int argc, char** argv) {
   run.method = method;
   run.body = body;
   run.latency = latency;
+  run.buf_count = static_cast<unsigned>(bufs);
+  run.buf_size = static_cast<unsigned>(buf_size);
   run.request.assign(run.method).append(" ").append(path).append(" HTTP/1.1\r\nHost: ")
       .append(hdr_host);
   for (const auto& hv : run.headers) {
@@ -873,7 +906,7 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "htgen: register_files: %s\n", std::strerror(-rc));
     return 1;
   }
-  void* mem = ::mmap(nullptr, static_cast<size_t>(kBufCount) * kBufSize,
+  void* mem = ::mmap(nullptr, static_cast<size_t>(run.buf_count) * run.buf_size,
                      PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (mem == MAP_FAILED) {
     std::fprintf(stderr, "htgen: mmap pool: %s\n", std::strerror(errno));
@@ -881,17 +914,18 @@ int main(int argc, char** argv) {
   }
   run.pool = static_cast<char*>(mem);
   int bre = 0;
-  run.br = io_uring_setup_buf_ring(&run.ring, kBufCount, kBufGroup, 0, &bre);
+  run.br = io_uring_setup_buf_ring(&run.ring, run.buf_count, kBufGroup, 0, &bre);
   if (run.br == nullptr) {
     std::fprintf(stderr, "htgen: setup_buf_ring: %s\n", std::strerror(-bre));
     return 1;
   }
-  const int mask = io_uring_buf_ring_mask(kBufCount);
-  for (uint32_t i = 0; i < kBufCount; i++) {
-    io_uring_buf_ring_add(run.br, run.pool + static_cast<size_t>(i) * kBufSize, kBufSize,
+  const int mask = io_uring_buf_ring_mask(run.buf_count);
+  for (uint32_t i = 0; i < run.buf_count; i++) {
+    io_uring_buf_ring_add(run.br, run.pool + static_cast<size_t>(i) * run.buf_size,
+                          run.buf_size,
                           static_cast<uint16_t>(i), mask, static_cast<int>(i));
   }
-  io_uring_buf_ring_advance(run.br, kBufCount);
+  io_uring_buf_ring_advance(run.br, static_cast<int>(run.buf_count));
   // RFC-free, kernel ABI: one recv completion may carry several buffers
   // instead of one. Needs liburing 2.6 and a kernel that answers with the
   // feature bit; built against an older header the whole idea is absent,
@@ -959,13 +993,16 @@ int main(int argc, char** argv) {
 
   std::printf(
       "responses=%llu bad=%llu seconds=%.3f rps=%.0f bytes=%llu MB/s=%.2f conns=%d "
-      "streams=%d pipeline=%d method=%s proto=%s bundles=%d\n",
+      "streams=%d pipeline=%d method=%s proto=%s bundles=%d bufs=%d/%d enobufs=%llu "
+      "rearms=%llu\n",
       static_cast<unsigned long long>(run.responses), static_cast<unsigned long long>(run.bad),
       elapsed, static_cast<double>(run.responses) / elapsed,
       static_cast<unsigned long long>(run.rx_bytes),
       static_cast<double>(run.rx_bytes) / elapsed / (1024.0 * 1024.0), conns, streams, pipeline,
       run.method.c_str(), h2 ? "h2" : "h1",
-      run.bundles ? 1 : 0);
+      run.bundles ? 1 : 0, bufs, buf_size,
+      static_cast<unsigned long long>(run.enobufs),
+      static_cast<unsigned long long>(run.rearms));
   if (run.latency) {
     // One line, the same shape as the counts: p50 is where half the
     // answers landed, max is the single worst. A percentile that fell
