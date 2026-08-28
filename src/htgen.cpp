@@ -32,7 +32,7 @@
 #include <cstdlib>
 #include <ctime>
 #include <memory>
-#include <string>
+#include <string_view>
 #include <vector>
 #include <utility>
 
@@ -80,6 +80,46 @@ constexpr uint32_t kLastClientId = 0x7ffffffd;
 
 enum : uint8_t { kOpRecv = 1, kOpSend = 2 };
 
+// A window onto memory somebody else owns, with the three operations the
+// wire paths used a std::string for. There is no allocation here and no
+// growth: every buffer is carved once, at startup, out of ONE block, and
+// a write that would not fit is a bug the run says out loud rather than
+// a silent realloc in the middle of a measurement.
+struct Buf {
+  char* p = nullptr;
+  size_t len = 0;
+  size_t cap = 0;
+
+  void bind(char* mem, size_t bytes) { p = mem; cap = bytes; len = 0; }
+  void clear() { len = 0; }
+  bool empty() const { return len == 0; }
+  size_t size() const { return len; }
+  const char* data() const { return p; }
+  char* data() { return p; }
+
+  void append(const char* s, size_t n) {
+    if (len + n > cap) {
+      std::fprintf(stderr, "htgen: buffer too small - %zu + %zu > %zu\n", len, n, cap);
+      std::exit(1);
+    }
+    std::memcpy(p + len, s, n);
+    len += n;
+  }
+  void append(const Buf& o) { append(o.p, o.len); }
+  void assign(const char* s, size_t n) { len = 0; append(s, n); }
+  void swap(Buf& o) {
+    char* tp = p; size_t tl = len, tc = cap;
+    p = o.p; len = o.len; cap = o.cap;
+    o.p = tp; o.len = tl; o.cap = tc;
+  }
+};
+
+// What points into argv or into the one block: a view, never an owner.
+// std::string_view is exactly this and allocates nothing, so it is the
+// spelling used - the wire paths below read .data()/.size() and copy
+// nothing.
+using Span = std::string_view;
+
 inline uint64_t tag(uint8_t op, uint32_t idx) {
   return (static_cast<uint64_t>(op) << 56) | idx;
 }
@@ -92,13 +132,13 @@ int64_t now_ns() {
 
 // RFC 9113 4.1: a frame with no payload of its own - SETTINGS ack, and
 // the shape every control frame here is appended in.
-void put_frame(std::string& out, uint32_t len, uint8_t type, uint8_t flags, uint32_t stream) {
+void put_frame(Buf& out, uint32_t len, uint8_t type, uint8_t flags, uint32_t stream) {
   unsigned char fh[kH2FrameHeaderLen];
   h2_put_frame_header(fh, len, type, flags, stream);
   out.append(reinterpret_cast<const char*>(fh), sizeof(fh));
 }
 
-void put_u32(std::string& out, uint32_t v) {
+void put_u32(Buf& out, uint32_t v) {
   const unsigned char b[4] = {static_cast<unsigned char>(v >> 24),
                               static_cast<unsigned char>(v >> 16),
                               static_cast<unsigned char>(v >> 8),
@@ -112,17 +152,23 @@ void put_u32(std::string& out, uint32_t v) {
 struct H2Conn {
   struct lshpack_enc enc;
   struct lshpack_dec dec;
-  std::string in;          // frames as they arrive, reassembled
-  size_t in_at = 0;        // how much of `in` is already consumed
-  std::string frag;        // RFC 9113 6.10: a block across CONTINUATIONs
+  // What is left of a frame that did not fit in one buffer, and nothing
+  // else: frames are parsed WHERE THEY LIE in the provided buffer, so a
+  // run copies only the few bytes that straddle a boundary rather than
+  // every byte it receives.
+  Buf carry;
+  // RFC 9113 6.10: a block across CONTINUATIONs, and ONLY then - a
+  // HEADERS that already carries END_HEADERS is decoded where it lies.
+  Buf frag;
   bool frag_end_stream = false;
-  std::vector<char> hdrbuf;
+  char* hdrbuf = nullptr;   // where one block's decoded fields land
+  size_t hdrbuf_cap = 0;
   // The four pseudo-fields do not change within a run, so the block they
   // encode to stops changing as soon as ls-hpack has them in its dynamic
   // table: from then on it emits indexed references and the bytes repeat.
   // Kept and re-emitted with a fresh stream id, the way the SERVER keeps
   // its answer head instead of encoding it again per request.
-  std::string hdr_block;
+  Buf hdr_block;
   bool hdr_frozen = false;
   uint32_t next_id = 1;
   uint32_t open = 0;       // streams in flight
@@ -132,7 +178,6 @@ struct H2Conn {
   H2Conn() {
     lshpack_enc_init(&enc);
     lshpack_dec_init(&dec);
-    hdrbuf.resize(8192);
   }
   ~H2Conn() {
     lshpack_enc_cleanup(&enc);
@@ -151,12 +196,12 @@ struct H2Conn {
 // and SAID, never folded into a percentile that would then be a guess.
 struct Latency {
   static constexpr uint32_t kBuckets = 1u << 16;  // 0..65535 us
-  std::vector<uint64_t> us;
+  uint64_t* us = nullptr;
   uint64_t over = 0;
   uint64_t n = 0;
   uint64_t max_us = 0;
 
-  Latency() : us(kBuckets, 0) {}
+  void bind(uint64_t* mem) { us = mem; }
 
   void add(int64_t ns) {
     const uint64_t v = static_cast<uint64_t>(ns < 0 ? 0 : ns) / 1000;
@@ -185,10 +230,10 @@ struct Conn {
   int fd = -1;
   size_t body_left = 0;   // RFC 9110 8.6: content still to arrive
   bool in_body = false;
-  std::string carry;      // only used when a HEAD spans two buffers
+  Buf carry;              // only used when a HEAD spans two buffers
   uint64_t done = 0;
-  std::string out;        // queued for the wire, nothing in flight yet
-  std::string wire;       // what the send in flight is reading from
+  Buf out;                // queued for the wire, nothing in flight yet
+  Buf wire;               // what the send in flight is reading from
   size_t sent_at = 0;     // how much of `wire` the kernel has taken
   bool sending = false;
   bool queued = false;    // already in Run::to_send this round
@@ -199,6 +244,9 @@ struct Conn {
   // request's.
   int64_t sent_ns = 0;
   std::vector<std::pair<uint32_t, int64_t>> inflight;
+  // The slice of the one block this connection's h2 buffers live in;
+  // H2Conn owns no memory of its own.
+  char* h2_mem = nullptr;
   std::unique_ptr<H2Conn> h2;
 };
 
@@ -216,9 +264,9 @@ struct Run {
   uint64_t rearms = 0;
   std::vector<Conn> conns;
   std::vector<int> fds;
-  std::string request;    // h1: the constant line; h2: unused
-  std::string path;
-  std::string authority;
+  Buf request;            // h1: the constant line; h2: unused
+  Span path;
+  Span authority;
   bool h2 = false;
   uint32_t streams = 1;
   bool bundles = false;
@@ -236,11 +284,13 @@ struct Run {
   // Extra request fields, spelled once. h1 keeps them in `request`; h2
   // encodes them after the pseudo-fields (RFC 9113 8.3: pseudo-fields
   // come first).
-  std::vector<std::pair<std::string, std::string>> headers;
+  Span header_name[32];
+  Span header_val[32];
+  size_t nheaders = 0;
   // RFC 9110 9: the method, and the content a request carries. GET with
   // no content is the default and the only shape htgen had.
-  std::string method = "GET";
-  std::string body;
+  Span method{"GET", 3};
+  Span body{};
   bool latency = false;
   Latency lat;
   std::vector<uint32_t> to_send;
@@ -359,9 +409,14 @@ struct Run {
       size_t clen = 0;
       for (size_t i = 0; i < nhdr; i++) {
         if (hdr[i].name_len == 14 && strncasecmp(hdr[i].name, "Content-Length", 14) == 0) {
-          clen = static_cast<size_t>(std::strtoull(std::string(hdr[i].value, hdr[i].value_len)
-                                                       .c_str(),
-                                                   nullptr, 10));
+          // RFC 9110 8.6: the field value is DIGIT+. Read where it lies -
+          // strtoull would want a terminator this buffer does not have.
+          clen = 0;
+          for (size_t k = 0; k < hdr[i].value_len; k++) {
+            const char d = hdr[i].value[k];
+            if (d < '0' || d > '9') { clen = 0; break; }
+            clen = clen * 10 + static_cast<size_t>(d - '0');
+          }
         }
       }
       const size_t consumed = static_cast<size_t>(r);
@@ -369,13 +424,19 @@ struct Run {
       c.in_body = true;
       c.body_left = clen;
       if (!c.carry.empty()) {
-        // The carry held the split head; what follows it is the content.
-        std::string tail(head + consumed, rest);
-        c.carry.clear();
-        if (!tail.empty()) h1_feed(idx, tail.data(), tail.size());
-        else if (clen == 0) {
-          c.in_body = false;
-          h1_complete(idx);
+        // The carry held the split head; what follows it is the content,
+        // and it is still IN the carry - so the recursion reads it there
+        // instead of copying it out first. The carry is only cleared
+        // once that read is done with it.
+        if (rest != 0) {
+          h1_feed(idx, head + consumed, rest);
+          c.carry.clear();
+        } else {
+          c.carry.clear();
+          if (clen == 0) {
+            c.in_body = false;
+            h1_complete(idx);
+          }
         }
         return;
       }
@@ -406,16 +467,25 @@ struct Run {
   void h2_open(uint32_t idx) {
     Conn& c = conns[idx];
     c.h2 = std::make_unique<H2Conn>();
+    char* m = c.h2_mem;
+    c.h2->carry.bind(m, kH2MaxFrameSize + kH2FrameHeaderLen);
+    m += kH2MaxFrameSize + kH2FrameHeaderLen;
+    c.h2->frag.bind(m, 64 * 1024);
+    m += 64 * 1024;
+    c.h2->hdrbuf = m;
+    c.h2->hdrbuf_cap = 64 * 1024;
+    m += 64 * 1024;
+    c.h2->hdr_block.bind(m, 1024);
     c.out.append(kH2Preface, kH2PrefaceLen);
-    std::string s;
-    s.push_back(0);
-    s.push_back(static_cast<char>(kH2SettingsEnablePush));
-    put_u32(s, 0);
-    s.push_back(0);
-    s.push_back(static_cast<char>(kH2SettingsInitialWindowSize));
-    put_u32(s, static_cast<uint32_t>(kH2WindowCeiling));
-    put_frame(c.out, static_cast<uint32_t>(s.size()), kH2Settings, 0, 0);
-    c.out.append(s);
+    // RFC 9113 6.5.1: two settings, six bytes each, spelled on the stack.
+    const uint32_t win = static_cast<uint32_t>(kH2WindowCeiling);
+    const unsigned char sets[12] = {
+        0, static_cast<unsigned char>(kH2SettingsEnablePush), 0, 0, 0, 0,
+        0, static_cast<unsigned char>(kH2SettingsInitialWindowSize),
+        static_cast<unsigned char>(win >> 24), static_cast<unsigned char>(win >> 16),
+        static_cast<unsigned char>(win >> 8), static_cast<unsigned char>(win)};
+    put_frame(c.out, sizeof(sets), kH2Settings, 0, 0);
+    c.out.append(reinterpret_cast<const char*>(sets), sizeof(sets));
     put_frame(c.out, 4, kH2WindowUpdate, 0, 0);
     put_u32(c.out, static_cast<uint32_t>(kH2WindowCeiling - kH2DefaultWindow));
   }
@@ -440,7 +510,7 @@ struct Run {
       c.out.append(h.hdr_block);
       if (!body.empty()) {
         put_frame(c.out, static_cast<uint32_t>(body.size()), kH2Data, kH2FlagEndStream, id);
-        c.out.append(body);
+        c.out.append(body.data(), body.size());
       }
       h.open++;
       return;
@@ -454,10 +524,9 @@ struct Run {
         h2_enc_field(&h.enc, ep, eend, ":authority", 10, authority.data(), authority.size()) &&
         h2_enc_field(&h.enc, ep, eend, ":path", 5, path.data(), path.size());
     bool ok_hdrs = ok;
-    for (const auto& hv : headers) {
-      if (!ok_hdrs) break;
-      ok_hdrs = h2_enc_field(&h.enc, ep, eend, hv.first.data(), hv.first.size(),
-                             hv.second.data(), hv.second.size());
+    for (size_t k = 0; k < nheaders && ok_hdrs; k++) {
+      ok_hdrs = h2_enc_field(&h.enc, ep, eend, header_name[k].data(), header_name[k].size(),
+                             header_val[k].data(), header_val[k].size());
     }
     if (!ok_hdrs) {
       std::fprintf(stderr, "htgen: the request does not fit one HEADERS frame\n");
@@ -483,7 +552,7 @@ struct Run {
     c.out.append(blk, blen);
     if (!body.empty()) {
       put_frame(c.out, static_cast<uint32_t>(body.size()), kH2Data, kH2FlagEndStream, id);
-      c.out.append(body);
+      c.out.append(body.data(), body.size());
     }
     h.open++;
   }
@@ -532,17 +601,24 @@ struct Run {
     size_t used = 0;
     bool ok_status = false;
     while (p < end) {
-      if (h.hdrbuf.size() < used + 4096) h.hdrbuf.resize(used + 4096);
+      if (used + 4096 > h.hdrbuf_cap) {
+        // One block cannot need more than the buffer carved for it; a
+        // peer that sends more is a peer this run stops trusting.
+        bad++;
+        h.done = true;
+        c.dead = true;
+        return;
+      }
       lsxpack_header_t xh;
-      lsxpack_header_prepare_decode(&xh, &h.hdrbuf[used], 0, 4096);
+      lsxpack_header_prepare_decode(&xh, h.hdrbuf + used, 0, 4096);
       if (lshpack_dec_decode(&h.dec, &p, end, &xh) != 0) {
         bad++;
         h.done = true;
         c.dead = true;
         return;
       }
-      const char* name = &h.hdrbuf[used] + xh.name_offset;
-      const char* val = &h.hdrbuf[used] + xh.val_offset;
+      const char* name = h.hdrbuf + used + xh.name_offset;
+      const char* val = h.hdrbuf + used + xh.val_offset;
       if (xh.name_len == 7 && std::memcmp(name, ":status", 7) == 0 && xh.val_len == 3) {
         ok_status = val[0] == '2';
       }
@@ -567,39 +643,43 @@ struct Run {
 
   // RFC 9113 4/6: frames in, responses out. Everything a server may send
   // is named - what this end acts on, and what it deliberately ignores.
-  void h2_feed(uint32_t idx, const char* p, size_t n) {
+  //
+  // Parses WHERE THE BYTES LIE. Returns how many it consumed; whatever is
+  // left is an incomplete frame, and only THAT is carried. The buffer it
+  // reads belongs to the kernel's provided ring and is handed back the
+  // moment this returns.
+  size_t h2_parse(uint32_t idx, const char* base, size_t n) {
     Conn& c = conns[idx];
     H2Conn& h = *c.h2;
-    if (h.done) return;
-    h.in.append(p, n);
-    for (;;) {
-      const size_t have = h.in.size() - h.in_at;
+    size_t at = 0;
+    while (!h.done) {
+      const size_t have = n - at;
       if (have < kH2FrameHeaderLen) break;
-      const unsigned char* f =
-          reinterpret_cast<const unsigned char*>(h.in.data()) + h.in_at;
+      const unsigned char* f = reinterpret_cast<const unsigned char*>(base) + at;
       const uint32_t len = h2_u24(f);
       if (len > kH2MaxFrameSize) {
         bad++;
         h.done = true;
         c.dead = true;
-        return;
+        return n;
       }
       if (have < kH2FrameHeaderLen + len) break;
       const uint8_t type = f[3];
       const uint8_t flags = f[4];
       const uint32_t sid = h2_u31(f + 5);
-      const unsigned char* body = f + kH2FrameHeaderLen;
+      const unsigned char* body_p = f + kH2FrameHeaderLen;
       size_t blen = len;
+      at += kH2FrameHeaderLen + len;
       // RFC 9113 6.1/6.2: padding first, then HEADERS' priority prefix.
       if ((type == kH2Data || type == kH2Headers) && (flags & kH2FlagPadded) != 0) {
-        const size_t pad = blen != 0 ? body[0] : 0;
+        const size_t pad = blen != 0 ? body_p[0] : 0;
         if (blen == 0 || pad + 1 > blen) {
           bad++;
           h.done = true;
           c.dead = true;
-          return;
+          return n;
         }
-        body += 1;
+        body_p += 1;
         blen -= pad + 1;
       }
       if (type == kH2Headers && (flags & kH2FlagPriority) != 0) {
@@ -607,12 +687,11 @@ struct Run {
           bad++;
           h.done = true;
           c.dead = true;
-          return;
+          return n;
         }
-        body += 5;
+        body_p += 5;
         blen -= 5;
       }
-      h.in_at += kH2FrameHeaderLen + len;
 
       switch (type) {
         case kH2Settings:
@@ -623,11 +702,10 @@ struct Run {
           // Read rather than only acknowledged.
           if ((flags & kH2FlagAck) == 0 && blen % 6 == 0) {
             for (size_t e = 0; e + 6 <= blen; e += 6) {
-              const uint16_t sid_key =
-                  static_cast<uint16_t>((body[e] << 8) | body[e + 1]);
-              if (sid_key != kH2SettingsHeaderTableSize) continue;
+              const uint16_t key = static_cast<uint16_t>((body_p[e] << 8) | body_p[e + 1]);
+              if (key != kH2SettingsHeaderTableSize) continue;
               uint32_t v = 0;
-              for (int b = 0; b < 4; b++) v = (v << 8) | body[e + 2 + b];
+              for (int b = 0; b < 4; b++) v = (v << 8) | body_p[e + 2 + b];
               // Clamped: the number is the peer's, the allocation is
               // ours. Encoding with a smaller table is always legal.
               lshpack_enc_set_max_capacity(&h.enc, v > kEncTableMax ? kEncTableMax : v);
@@ -635,6 +713,8 @@ struct Run {
               h.hdr_block.clear();
             }
           }
+          // RFC 9113 6.5.3: every SETTINGS is acknowledged, and the ack
+          // itself is never acknowledged.
           if ((flags & kH2FlagAck) == 0) {
             put_frame(c.out, 0, kH2Settings, kH2FlagAck, 0);
             queue(idx);
@@ -644,28 +724,30 @@ struct Run {
           // RFC 9113 6.7: the same 8 bytes back, with ACK set.
           if ((flags & kH2FlagAck) == 0 && blen == 8) {
             put_frame(c.out, 8, kH2Ping, kH2FlagAck, 0);
-            c.out.append(reinterpret_cast<const char*>(body), 8);
+            c.out.append(reinterpret_cast<const char*>(body_p), 8);
             queue(idx);
           }
           break;
         case kH2Headers:
-          h.frag.assign(reinterpret_cast<const char*>(body), blen);
           h.frag_end_stream = (flags & kH2FlagEndStream) != 0;
           if ((flags & kH2FlagEndHeaders) != 0) {
-            h2_headers(idx, reinterpret_cast<const unsigned char*>(h.frag.data()),
-                       h.frag.size());
-            h.frag.clear();
-            if (h.done) return;
+            // The whole block is here, so it is decoded HERE - no copy.
+            // frag exists for the split CONTINUATION makes, and this is
+            // not one.
+            h2_headers(idx, body_p, blen);
+            if (h.done) return n;
             if (h.frag_end_stream) h2_stream_done(idx, sid);
+          } else {
+            h.frag.assign(reinterpret_cast<const char*>(body_p), blen);
           }
           break;
         case kH2Continuation:
-          h.frag.append(reinterpret_cast<const char*>(body), blen);
+          h.frag.append(reinterpret_cast<const char*>(body_p), blen);
           if ((flags & kH2FlagEndHeaders) != 0) {
             h2_headers(idx, reinterpret_cast<const unsigned char*>(h.frag.data()),
                        h.frag.size());
             h.frag.clear();
-            if (h.done) return;
+            if (h.done) return n;
             if (h.frag_end_stream) h2_stream_done(idx, sid);
           }
           break;
@@ -689,22 +771,36 @@ struct Run {
           bad++;
           h.done = true;
           c.dead = true;
-          return;
+          return n;
         default:
           // RFC 9113 6.3/6.9/4.1: PRIORITY, WINDOW_UPDATE and anything
           // unknown are read past. Nothing here waits on a send window.
           (void)sid;
           break;
       }
-      // Consumed frames are dropped in one move, not one erase per frame.
-      if (h.in_at > 8192) {
-        h.in.erase(0, h.in_at);
-        h.in_at = 0;
-      }
     }
-    if (h.in_at != 0 && h.in_at == h.in.size()) {
-      h.in.clear();
-      h.in_at = 0;
+    return at;
+  }
+
+  // The carry is the ONLY copy this path makes, and only of the bytes
+  // that straddle a buffer boundary.
+  void h2_feed(uint32_t idx, const char* p, size_t n) {
+    Conn& c = conns[idx];
+    H2Conn& h = *c.h2;
+    if (h.done) return;
+    if (h.carry.empty()) {
+      const size_t used = h2_parse(idx, p, n);
+      if (used < n) h.carry.assign(p + used, n - used);
+      return;
+    }
+    h.carry.append(p, n);
+    const size_t used = h2_parse(idx, h.carry.data(), h.carry.size());
+    if (used == h.carry.size()) {
+      h.carry.clear();
+    } else if (used != 0) {
+      const size_t rest = h.carry.size() - used;
+      std::memmove(h.carry.data(), h.carry.data() + used, rest);
+      h.carry.len = rest;
     }
   }
 
@@ -789,7 +885,9 @@ int main(int argc, char** argv) {
   bool latency = false;
   int bufs = static_cast<int>(kBufCountDefault);
   int buf_size = static_cast<int>(kBufSizeDefault);
-  std::vector<std::pair<std::string, std::string>> extra;
+  Span extra_name[32];
+  Span extra_val[32];
+  size_t nextra = 0;
   bool h2 = false;
   double seconds = 5.0;
   for (int i = 1; i < argc; i++) {
@@ -811,23 +909,28 @@ int main(int argc, char** argv) {
     else if (std::strcmp(argv[i], "--bufs") == 0) bufs = std::atoi(next());
     else if (std::strcmp(argv[i], "--buf-size") == 0) buf_size = std::atoi(next());
     else if (std::strcmp(argv[i], "--header") == 0) {
-      const char* h = next();
+      char* h = const_cast<char*>(next());
       if (h == nullptr) { std::fprintf(stderr, "htgen: --header wants NAME:VALUE\n"); return 2; }
-      const char* colon = std::strchr(h, ':');
+      char* colon = std::strchr(h, ':');
       if (colon == nullptr || colon == h) {
         std::fprintf(stderr, "htgen: --header wants NAME:VALUE, got %s\n", h);
         return 2;
       }
-      std::string name(h, static_cast<size_t>(colon - h));
-      const char* v = colon + 1;
-      while (*v == ' ' || *v == '\t') v++;
-      // RFC 9113 8.2: h2 field names are lowercase, and ls-hpack indexes
-      // the static table by the lowercase spelling. Done once, here, so
-      // both protocols carry the same field.
-      for (char& c : name) {
-        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c + 32);
+      if (nextra == 32) {
+        std::fprintf(stderr, "htgen: at most 32 --header\n");
+        return 2;
       }
-      extra.emplace_back(std::move(name), std::string(v));
+      // RFC 9113 8.2: h2 field names are lowercase, and ls-hpack indexes
+      // the static table by that spelling. Lowercased IN PLACE, in argv,
+      // which outlives the run - so the field is never copied anywhere.
+      for (char* q = h; q < colon; q++) {
+        if (*q >= 'A' && *q <= 'Z') *q = static_cast<char>(*q + 32);
+      }
+      char* v = colon + 1;
+      while (*v == ' ' || *v == '\t') v++;
+      extra_name[nextra] = Span(h, static_cast<size_t>(colon - h));
+      extra_val[nextra] = Span(v, std::strlen(v));
+      nextra++;
     }
     else {
       std::fprintf(stderr, "htgen: unknown argument %s\n", argv[i]);
@@ -854,18 +957,30 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "htgen: --body and --body-file name the same thing; pick one\n");
     return 2;
   }
-  std::string body;
-  if (body_arg != nullptr) body.assign(body_arg);
+  // --body points into argv; --body-file gets ONE buffer, read once,
+  // sized from the file and never grown.
+  Span body{};
+  char* body_mem = nullptr;
+  if (body_arg != nullptr) body = Span(body_arg, std::strlen(body_arg));
   if (body_file != nullptr) {
     std::FILE* bf = std::fopen(body_file, "rb");
     if (bf == nullptr) {
       std::fprintf(stderr, "htgen: cannot open %s: %s\n", body_file, std::strerror(errno));
       return 2;
     }
-    char chunk[8192];
-    size_t got;
-    while ((got = std::fread(chunk, 1, sizeof(chunk), bf)) != 0) body.append(chunk, got);
+    std::fseek(bf, 0, SEEK_END);
+    const long fsz = std::ftell(bf);
+    std::fseek(bf, 0, SEEK_SET);
+    if (fsz < 0 || fsz > (1 << 20)) {
+      std::fprintf(stderr, "htgen: --body-file must be 0..1048576 bytes\n");
+      std::fclose(bf);
+      return 2;
+    }
+    body_mem = static_cast<char*>(std::malloc(static_cast<size_t>(fsz) + 1));
+    if (body_mem == nullptr) { std::fclose(bf); return 1; }
+    const size_t got = std::fread(body_mem, 1, static_cast<size_t>(fsz), bf);
     std::fclose(bf);
+    body = Span(body_mem, got);
   }
   // RFC 9113 6.9.2: a stream's initial send window is 65535 and this end
   // never grows it, so content larger than one window would stall
@@ -911,30 +1026,86 @@ int main(int argc, char** argv) {
   Run run;
   run.h2 = h2;
   run.streams = static_cast<uint32_t>(streams);
-  run.path = path;
-  run.authority = hdr_host;
+  run.path = Span(path, std::strlen(path));
+  run.authority = Span(hdr_host, std::strlen(hdr_host));
   run.pipeline = static_cast<uint32_t>(pipeline);
-  run.headers = extra;
-  run.method = method;
+  for (size_t k = 0; k < nextra; k++) {
+    run.header_name[k] = extra_name[k];
+    run.header_val[k] = extra_val[k];
+  }
+  run.nheaders = nextra;
+  run.method = Span(method, std::strlen(method));
   run.body = body;
   run.latency = latency;
   run.buf_count = static_cast<unsigned>(bufs);
   run.buf_size = static_cast<unsigned>(buf_size);
-  run.request.assign(run.method).append(" ").append(path).append(" HTTP/1.1\r\nHost: ")
-      .append(hdr_host);
-  for (const auto& hv : run.headers) {
-    run.request.append("\r\n").append(hv.first).append(": ").append(hv.second);
+
+  // ONE block, carved once, for every per-connection wire buffer. After
+  // this line the request path does not touch the allocator again: the
+  // sizes are what the SHAPE of the run needs, so a buffer that would
+  // overflow is a wrong size here rather than a realloc in the middle
+  // of a measurement.
+  const size_t one_req = 64 + std::strlen(path) + std::strlen(hdr_host) + body.size() +
+                         32 * 256;
+  const size_t out_cap = h2 ? (64 + static_cast<size_t>(streams) * (one_req + 32))
+                            : (64 + static_cast<size_t>(pipeline) * one_req);
+  const size_t carry_cap = kH2MaxFrameSize + kH2FrameHeaderLen;
+  const size_t frag_cap = 64 * 1024;
+  const size_t hdrbuf_cap = 64 * 1024;
+  const size_t blk_cap = 1024;
+  const size_t per_conn = 2 * out_cap + (h2 ? carry_cap + frag_cap + hdrbuf_cap + blk_cap
+                                            : carry_cap);
+  const size_t lat_bytes = latency ? Latency::kBuckets * sizeof(uint64_t) : 0;
+  char* block = static_cast<char*>(std::calloc(1, per_conn * static_cast<size_t>(conns) +
+                                                  out_cap + lat_bytes));
+  if (block == nullptr) {
+    std::fprintf(stderr, "htgen: cannot reserve %zu bytes of wire buffers\n",
+                 per_conn * static_cast<size_t>(conns));
+    return 1;
+  }
+  char* cursor = block;
+  run.request.bind(cursor, out_cap);
+  cursor += out_cap;
+  if (latency) {
+    run.lat.bind(reinterpret_cast<uint64_t*>(cursor));
+    cursor += lat_bytes;
+  }
+  run.request.assign(run.method.data(), run.method.size());
+  run.request.append(" ", 1);
+  run.request.append(path, std::strlen(path));
+  run.request.append(" HTTP/1.1\r\nHost: ", 17);
+  run.request.append(hdr_host, std::strlen(hdr_host));
+  for (size_t k = 0; k < run.nheaders; k++) {
+    run.request.append("\r\n", 2);
+    run.request.append(run.header_name[k].data(), run.header_name[k].size());
+    run.request.append(": ", 2);
+    run.request.append(run.header_val[k].data(), run.header_val[k].size());
   }
   // RFC 9110 8.6: content is announced, always - a request without a
   // Content-Length and without chunked has no content at all, and a
   // server is right to answer 411 or read the next request out of the
   // body. Sent even for an empty --body, because "0" is an answer.
   if (!run.body.empty()) {
-    run.request.append("\r\nContent-Length: ").append(std::to_string(run.body.size()));
+    char cl[32];
+    const int cln = std::snprintf(cl, sizeof(cl), "\r\nContent-Length: %zu", run.body.size());
+    run.request.append(cl, static_cast<size_t>(cln));
   }
-  run.request.append("\r\n\r\n").append(run.body);
+  run.request.append("\r\n\r\n", 4);
+  if (!run.body.empty()) run.request.append(run.body.data(), run.body.size());
   run.conns.resize(static_cast<size_t>(conns));
   run.fds.resize(static_cast<size_t>(conns));
+  for (int i = 0; i < conns; i++) {
+    Conn& cc = run.conns[static_cast<size_t>(i)];
+    cc.out.bind(cursor, out_cap);   cursor += out_cap;
+    cc.wire.bind(cursor, out_cap);  cursor += out_cap;
+    if (h2) {
+      cc.h2_mem = cursor;
+      cursor += carry_cap + frag_cap + hdrbuf_cap + blk_cap;
+    } else {
+      cc.carry.bind(cursor, carry_cap);
+      cursor += carry_cap;
+    }
+  }
   for (int i = 0; i < conns; i++) {
     const int fd = sock != nullptr ? connect_unix(sock) : connect_tcp(host, port);
     if (fd < 0) {
@@ -1052,7 +1223,7 @@ int main(int argc, char** argv) {
       elapsed, static_cast<double>(run.responses) / elapsed,
       static_cast<unsigned long long>(run.rx_bytes),
       static_cast<double>(run.rx_bytes) / elapsed / (1024.0 * 1024.0), conns, streams, pipeline,
-      run.method.c_str(), h2 ? "h2" : "h1",
+      method, h2 ? "h2" : "h1",
       run.bundles ? 1 : 0, bufs, buf_size,
       static_cast<unsigned long long>(run.enobufs),
       static_cast<unsigned long long>(run.rearms));
@@ -1060,16 +1231,18 @@ int main(int argc, char** argv) {
     // One line, the same shape as the counts: p50 is where half the
     // answers landed, max is the single worst. A percentile that fell
     // past the histogram's 65 ms says so instead of printing the cap.
-    const auto spell = [&](double q) {
+    char q50[24], q90[24], q99[24], q999[24];
+    const auto spell = [&](double q, char* out) {
       const uint64_t v = run.lat.quantile(q);
-      static char buf[32];
-      if (v >= Latency::kBuckets) std::snprintf(buf, sizeof(buf), ">65535");
-      else std::snprintf(buf, sizeof(buf), "%llu", static_cast<unsigned long long>(v));
-      return std::string(buf);
+      if (v >= Latency::kBuckets) std::snprintf(out, 24, ">65535");
+      else std::snprintf(out, 24, "%llu", static_cast<unsigned long long>(v));
     };
+    spell(0.50, q50);
+    spell(0.90, q90);
+    spell(0.99, q99);
+    spell(0.999, q999);
     std::printf("latency_us p50=%s p90=%s p99=%s p999=%s max=%llu over65ms=%llu n=%llu\n",
-                spell(0.50).c_str(), spell(0.90).c_str(), spell(0.99).c_str(),
-                spell(0.999).c_str(), static_cast<unsigned long long>(run.lat.max_us),
+                q50, q90, q99, q999, static_cast<unsigned long long>(run.lat.max_us),
                 static_cast<unsigned long long>(run.lat.over),
                 static_cast<unsigned long long>(run.lat.n));
   }
