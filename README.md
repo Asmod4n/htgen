@@ -25,10 +25,9 @@ Measured on one 4-vCPU box, same server, same route, TCP, `-c8`, 3 s:
 | 1 request in flight | 66 929 rps | 212 097 rps |
 | 64 streams | 631 573 rps | 2 109 802 rps |
 
-htgen does what the server does, with the roles swapped: connect instead
-of accept, multishot recv out of a provided buffer ring, send bundles
-where the kernel offers them, one ring enter carrying hundreds of
-completions.
+htgen is built the way a modern server is: multishot recv out of a
+provided buffer ring, send bundles where the kernel offers them, one ring
+enter carrying hundreds of completions.
 
 ## Options
 

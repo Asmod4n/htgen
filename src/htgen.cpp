@@ -1,12 +1,11 @@
-// htgen: an HTTP load generator on io_uring, one ring and one thread.
+// htgen: an HTTP load generator on io_uring. One ring, one thread.
 //
-// wrk costs about three times as much CPU per request as a ring server
-// spends answering it, so on a fast host a benchmark stops measuring the
-// server and starts measuring wrk - and raising its thread count only
-// moves the wall. This does the same thing a ring server does, with the
-// roles swapped: connect instead of accept, multishot recv out of a
-// provided buffer ring, send bundles where the kernel offers them, one
-// ring enter carrying hundreds of completions.
+// A thread-per-core client spends more CPU per request than a modern
+// server spends answering one, and past a certain server that is what a
+// benchmark ends up measuring. htgen is built the way such a server is:
+// multishot recv out of a provided buffer ring, send bundles where the
+// kernel offers them, one ring enter carrying hundreds of completions,
+// and one outstanding request per connection unless asked for more.
 //
 //   htgen --sock PATH [--conns N] [--seconds S] [--path P] [--host H]
 //   htgen --host 127.0.0.1 --port 8123 [...]
@@ -18,9 +17,7 @@
 // carries, that stream ids are odd, and that a stream ending is a
 // response.
 //
-// Prints one line of counts. h2load and wrk stay the ORACLES: a number
-// from here means nothing until one of them says roughly the same thing
-// on the same box.
+// Prints one line of counts.
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -50,7 +47,9 @@ namespace {
 
 using namespace htgen;
 
-// The reactor's own geometry, so the two ends are priced the same way.
+// Ring geometry. 2048 buffers of 4 KiB is enough that a burst of small
+// responses lands in one completion batch without the pool running dry,
+// and small enough to stay in cache.
 constexpr unsigned kBufCount = 2048;
 constexpr unsigned kBufSize = 4096;
 constexpr unsigned kBufGroup = 1;
@@ -136,12 +135,12 @@ struct Conn {
   std::string wire;       // what the send in flight is reading from
   size_t sent_at = 0;     // how much of `wire` the kernel has taken
   bool sending = false;
-  bool queued = false;    // already in Load::to_send this round
+  bool queued = false;    // already in Run::to_send this round
   bool dead = false;
   std::unique_ptr<H2Conn> h2;
 };
 
-struct Load {
+struct Run {
   struct io_uring ring {};
   struct io_uring_buf_ring* br = nullptr;
   char* pool = nullptr;
@@ -654,15 +653,15 @@ int main(int argc, char** argv) {
     return 2;
   }
 
-  Load L;
-  L.h2 = h2;
-  L.streams = static_cast<uint32_t>(streams);
-  L.path = path;
-  L.authority = hdr_host;
-  L.request.assign("GET ").append(path).append(" HTTP/1.1\r\nHost: ").append(hdr_host).append(
+  Run run;
+  run.h2 = h2;
+  run.streams = static_cast<uint32_t>(streams);
+  run.path = path;
+  run.authority = hdr_host;
+  run.request.assign("GET ").append(path).append(" HTTP/1.1\r\nHost: ").append(hdr_host).append(
       "\r\n\r\n");
-  L.conns.resize(static_cast<size_t>(conns));
-  L.fds.resize(static_cast<size_t>(conns));
+  run.conns.resize(static_cast<size_t>(conns));
+  run.fds.resize(static_cast<size_t>(conns));
   for (int i = 0; i < conns; i++) {
     const int fd = sock != nullptr ? connect_unix(sock) : connect_tcp(host, port);
     if (fd < 0) {
@@ -670,19 +669,19 @@ int main(int argc, char** argv) {
                    std::strerror(errno));
       return 1;
     }
-    L.conns[static_cast<size_t>(i)].fd = fd;
-    L.fds[static_cast<size_t>(i)] = fd;
+    run.conns[static_cast<size_t>(i)].fd = fd;
+    run.fds[static_cast<size_t>(i)] = fd;
   }
 
   struct io_uring_params p {};
   p.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN | IORING_SETUP_COOP_TASKRUN;
-  int rc = io_uring_queue_init_params(kSqEntries, &L.ring, &p);
+  int rc = io_uring_queue_init_params(kSqEntries, &run.ring, &p);
   if (rc != 0) {
     std::fprintf(stderr, "htgen: queue_init: %s\n", std::strerror(-rc));
     return 1;
   }
-  io_uring_register_ring_fd(&L.ring);
-  rc = io_uring_register_files(&L.ring, L.fds.data(), static_cast<unsigned>(conns));
+  io_uring_register_ring_fd(&run.ring);
+  rc = io_uring_register_files(&run.ring, run.fds.data(), static_cast<unsigned>(conns));
   if (rc != 0) {
     std::fprintf(stderr, "htgen: register_files: %s\n", std::strerror(-rc));
     return 1;
@@ -693,47 +692,47 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "htgen: mmap pool: %s\n", std::strerror(errno));
     return 1;
   }
-  L.pool = static_cast<char*>(mem);
+  run.pool = static_cast<char*>(mem);
   int bre = 0;
-  L.br = io_uring_setup_buf_ring(&L.ring, kBufCount, kBufGroup, 0, &bre);
-  if (L.br == nullptr) {
+  run.br = io_uring_setup_buf_ring(&run.ring, kBufCount, kBufGroup, 0, &bre);
+  if (run.br == nullptr) {
     std::fprintf(stderr, "htgen: setup_buf_ring: %s\n", std::strerror(-bre));
     return 1;
   }
   const int mask = io_uring_buf_ring_mask(kBufCount);
   for (uint32_t i = 0; i < kBufCount; i++) {
-    io_uring_buf_ring_add(L.br, L.pool + static_cast<size_t>(i) * kBufSize, kBufSize,
+    io_uring_buf_ring_add(run.br, run.pool + static_cast<size_t>(i) * kBufSize, kBufSize,
                           static_cast<uint16_t>(i), mask, static_cast<int>(i));
   }
-  io_uring_buf_ring_advance(L.br, kBufCount);
+  io_uring_buf_ring_advance(run.br, kBufCount);
   // RFC-free, kernel ABI: one recv completion may carry several buffers
   // instead of one. Needs liburing 2.6 and a kernel that answers with the
   // feature bit; built against an older header the whole idea is absent,
   // and the run says so rather than silently costing a syscall per buffer.
 #ifdef IORING_FEAT_RECVSEND_BUNDLE
-  L.bundles = (L.ring.features & IORING_FEAT_RECVSEND_BUNDLE) != 0;
+  run.bundles = (run.ring.features & IORING_FEAT_RECVSEND_BUNDLE) != 0;
 #else
-  L.bundles = false;
+  run.bundles = false;
   std::fprintf(stderr, "htgen: built against a liburing without send/recv bundles - "
                        "one completion per buffer\n");
 #endif
   if (const char* e = std::getenv("HTGEN_BUNDLE")) {
-    if (e[0] == '0') L.bundles = false;
+    if (e[0] == '0') run.bundles = false;
   }
 
   for (int i = 0; i < conns; i++) {
     const uint32_t idx = static_cast<uint32_t>(i);
-    L.arm_recv(idx);
+    run.arm_recv(idx);
     if (h2) {
-      L.h2_open(idx);
-      L.h2_fill(idx);
+      run.h2_open(idx);
+      run.h2_fill(idx);
     } else {
-      L.conns[idx].out.append(L.request);
+      run.conns[idx].out.append(run.request);
     }
-    L.conns[idx].queued = false;
-    L.arm_send(idx);
+    run.conns[idx].queued = false;
+    run.arm_send(idx);
   }
-  L.to_send.clear();
+  run.to_send.clear();
 
   const int64_t t0 = now_ns();
   const int64_t deadline = t0 + static_cast<int64_t>(seconds * 1e9);
@@ -742,36 +741,36 @@ int main(int argc, char** argv) {
     if (left <= 0) break;
     struct __kernel_timespec ts {left / 1000000000, left % 1000000000};
     struct io_uring_cqe* first = nullptr;
-    io_uring_submit_and_wait_timeout(&L.ring, &first, 1, &ts, nullptr);
+    io_uring_submit_and_wait_timeout(&run.ring, &first, 1, &ts, nullptr);
 
     unsigned head = 0;
     struct io_uring_cqe* cqe = nullptr;
     unsigned seen = 0;
-    io_uring_for_each_cqe(&L.ring, head, cqe) {
+    io_uring_for_each_cqe(&run.ring, head, cqe) {
       const uint64_t d = io_uring_cqe_get_data64(cqe);
       const uint8_t op = static_cast<uint8_t>(d >> 56);
       const uint32_t idx = static_cast<uint32_t>(d & 0xffffffffu);
-      if (op == kOpRecv) L.on_recv(idx, cqe);
-      else if (op == kOpSend) L.on_send(idx, cqe);
+      if (op == kOpRecv) run.on_recv(idx, cqe);
+      else if (op == kOpSend) run.on_send(idx, cqe);
       seen++;
     }
-    io_uring_cq_advance(&L.ring, seen);
-    if (L.replenish != 0) {
-      io_uring_buf_ring_advance(L.br, static_cast<int>(L.replenish));
-      L.replenish = 0;
+    io_uring_cq_advance(&run.ring, seen);
+    if (run.replenish != 0) {
+      io_uring_buf_ring_advance(run.br, static_cast<int>(run.replenish));
+      run.replenish = 0;
     }
-    for (uint32_t idx : L.to_send) {
-      L.conns[idx].queued = false;
-      L.arm_send(idx);
+    for (uint32_t idx : run.to_send) {
+      run.conns[idx].queued = false;
+      run.arm_send(idx);
     }
-    L.to_send.clear();
+    run.to_send.clear();
   }
   const double elapsed = static_cast<double>(now_ns() - t0) / 1e9;
 
   std::printf(
       "responses=%llu bad=%llu seconds=%.3f rps=%.0f conns=%d streams=%d proto=%s bundles=%d\n",
-      static_cast<unsigned long long>(L.responses), static_cast<unsigned long long>(L.bad),
-      elapsed, static_cast<double>(L.responses) / elapsed, conns, streams, h2 ? "h2" : "h1",
-      L.bundles ? 1 : 0);
+      static_cast<unsigned long long>(run.responses), static_cast<unsigned long long>(run.bad),
+      elapsed, static_cast<double>(run.responses) / elapsed, conns, streams, h2 ? "h2" : "h1",
+      run.bundles ? 1 : 0);
   return 0;
 }

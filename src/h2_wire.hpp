@@ -6,19 +6,9 @@
 // preface, the nine header bytes, the big-endian reads, and one HPACK
 // field encode.
 //
-// This began as webmachine-mruby's src/h2_wire.hpp, shared there between
-// the server and the load generator that used to live in its tree.
-//
-// TEMPORARY COPY. It is meant to become one small library that both sides
-// take as a submodule, and this file goes away when that exists. It was
-// briefly argued that a separate copy is BETTER - that a client built out
-// of the server's frame layer cannot find a shared misreading, where both
-// ends agree and both are wrong. That argument is right in general and
-// almost empty here: what is in this file is RFC 9113 transcription, and
-// the h2 knowledge worth writing twice - the state machine, flow control,
-// CONTINUATION, the stream lifecycle - is NOT here. It lives in the
-// server's http2.cpp and in htgen.cpp, already independently written, and
-// stays that way whether or not the transcription is shared.
+// Transcription, not design: every number below is the RFC's. Nothing
+// that decides anything lives here - the frame loop, flow control,
+// CONTINUATION and the stream lifecycle are htgen.cpp's.
 //
 // Header-only and free of everything else: no io_uring, no connection
 // state. Only <cstddef>/<cstdint> and ls-hpack.
