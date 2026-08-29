@@ -65,6 +65,10 @@ constexpr unsigned kBufGroup = 1;
 // RFC, and it arrives from the peer - so the ceiling on what our encoder
 // will allocate for it is ours to set.
 constexpr uint32_t kEncTableMax = 65536;
+// RFC 7541: the room ONE decoded field may take. The same ceiling the
+// per-field window always had - what changed is that every field now
+// reuses it instead of the next 4 KiB along.
+constexpr unsigned kHdrFieldMax = 4096;
 constexpr unsigned kSqEntries = 16384;
 
 // RFC 9113 6.9: the client's own receive window. Opened once to the
@@ -161,7 +165,7 @@ struct H2Conn {
   // HEADERS that already carries END_HEADERS is decoded where it lies.
   Buf frag;
   bool frag_end_stream = false;
-  char* hdrbuf = nullptr;   // where one block's decoded fields land
+  char* hdrbuf = nullptr;   // where ONE field lands while it is read
   size_t hdrbuf_cap = 0;
   // The four pseudo-fields do not change within a run, so the block they
   // encode to stops changing as soon as ls-hpack has them in its dynamic
@@ -599,31 +603,32 @@ struct Run {
     H2Conn& h = *c.h2;
     const unsigned char* p = blk;
     const unsigned char* const end = blk + len;
-    size_t used = 0;
     bool ok_status = false;
+    // EVERY field decodes into the SAME window. Nothing here outlives the
+    // iteration that made it - the status is read and answered on the
+    // spot, and every other field is discarded - so walking the buffer
+    // forward per field only bought cold cache lines. A five-field block
+    // touched 20 KiB across a 64 KiB buffer, per response, for bytes
+    // nobody reads twice; now it touches the same few hundred, and they
+    // stay hot across millions of them.
+    //
+    // The decode itself cannot be skipped: HPACK is stateful and a block
+    // this end does not decode is a decoder that no longer agrees with
+    // the peer about anything.
     while (p < end) {
-      if (used + 4096 > h.hdrbuf_cap) {
-        // One block cannot need more than the buffer carved for it; a
-        // peer that sends more is a peer this run stops trusting.
-        bad++;
-        h.done = true;
-        c.dead = true;
-        return;
-      }
       lsxpack_header_t xh;
-      lsxpack_header_prepare_decode(&xh, h.hdrbuf + used, 0, 4096);
+      lsxpack_header_prepare_decode(&xh, h.hdrbuf, 0, kHdrFieldMax);
       if (lshpack_dec_decode(&h.dec, &p, end, &xh) != 0) {
         bad++;
         h.done = true;
         c.dead = true;
         return;
       }
-      const char* name = h.hdrbuf + used + xh.name_offset;
-      const char* val = h.hdrbuf + used + xh.val_offset;
+      const char* name = h.hdrbuf + xh.name_offset;
+      const char* val = h.hdrbuf + xh.val_offset;
       if (xh.name_len == 7 && std::memcmp(name, ":status", 7) == 0 && xh.val_len == 3) {
         ok_status = val[0] == '2';
       }
-      used += xh.val_offset + xh.val_len;
     }
     if (!ok_status) bad++;
   }
