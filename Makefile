@@ -41,15 +41,46 @@ URING_LIBS   := $(URING)/src/liburing.a
 URING_DEP    := $(URING)/src/liburing.a
 endif
 
+# TLS is off unless a path to mruby-ktls says otherwise, and it is a
+# PATH rather than a submodule on purpose: the library needs an OpenSSL
+# that was built WITH kTLS, and the distribution's usually was not
+# (Ubuntu's libssl.so.3 exports no ktls symbol). mruby-ktls builds one
+# and keeps it; point OPENSSL at that directory.
+#
+#   make KTLS=~/webmachine-mruby/mruby/build/repos/host/mruby-ktls \
+#        OPENSSL=~/webmachine-mruby/mruby/build/host/mrbgems/mruby-ktls/openssl
+#
+# Without it htgen builds as before and --tls refuses by name.
+ifdef KTLS
+OPENSSL  ?= $(KTLS)/build/openssl
+# TWO include paths, and both are needed: a configured OpenSSL puts its
+# generated headers in the build directory and keeps the rest in its
+# source tree. One of them alone fails on <openssl/e_ostime.h>.
+OSSL_INC := -I$(OPENSSL)/include -I$(KTLS)/deps/openssl/include
+TLS_CFLAGS := -DHTGEN_TLS=1 -I$(KTLS)/include $(OSSL_INC)
+TLS_LIBS   := -L$(OPENSSL) -lssl -lcrypto -Wl,-rpath,$(OPENSSL)
+TLS_OBJS   := build/ktls.o
+else
+TLS_CFLAGS :=
+TLS_LIBS   :=
+TLS_OBJS   :=
+endif
+
 PREFIX  ?= /usr/local
 BINDIR  ?= $(PREFIX)/bin
 DESTDIR ?=
 INSTALL ?= install
 
-OBJS := build/htgen.o build/lshpack.o build/xxhash.o build/picohttpparser.o
+OBJS := build/htgen.o build/lshpack.o build/xxhash.o build/picohttpparser.o $(TLS_OBJS)
 
 htgen: $(OBJS) $(URING_DEP)
-	$(CXX) $(OBJS) $(URING_LIBS) -o $@
+	$(CXX) $(OBJS) $(URING_LIBS) $(TLS_LIBS) -o $@
+
+# The library is one C file. It is compiled here rather than taken as an
+# archive because mruby-ktls builds inside mruby's build system, and a
+# load generator is not going to carry one.
+build/ktls.o: $(KTLS)/src/ktls.c | build
+	$(CC) $(CFLAGS) -I$(KTLS)/include $(OSSL_INC) -c $< -o $@
 
 # liburing's own build. Its configure writes config-host.mak, which its
 # Makefile needs, so both run here and only when the archive is missing.
@@ -61,7 +92,7 @@ build:
 	@mkdir -p build
 
 build/htgen.o: src/htgen.cpp src/h2_wire.hpp $(URING_DEP) | build $(HPACK)/lshpack.h
-	$(CXX) $(CXXFLAGS) $(INCLUDES) $(URING_CFLAGS) -c $< -o $@
+	$(CXX) $(CXXFLAGS) $(INCLUDES) $(URING_CFLAGS) $(TLS_CFLAGS) -c $< -o $@
 
 # The C dependencies are C. Feeding lshpack.c to a C++ compiler fails on
 # its designated initialisers and its implicit void* conversions - the

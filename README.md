@@ -57,6 +57,10 @@ make install PREFIX=$HOME/.local  # ~/.local/bin/htgen
 --path P              request target (default /)
 --host-header H       the Host header, and h2's :authority (default localhost)
 --h2                  speak HTTP/2 with prior knowledge (RFC 9113 3.4)
+--tls                 agree TLS 1.3 keys, hand them to the kernel, and
+                      measure through kTLS. TCP only. Needs a build with
+                      KTLS= (see Requirements); ALPN names h2 with --h2
+                      and http/1.1 without.
 --streams M           concurrent streams per connection, --h2 only (default 1)
 --pipeline D          h1 requests in flight per connection (RFC 9112
                       9.3.2), h1 only (default 1)
@@ -135,7 +139,9 @@ its floor.
 ## Requirements
 
 Linux with io_uring, a C++20 compiler. Everything else is a submodule:
-liburing, ls-hpack (HPACK, RFC 7541), picohttpparser.
+liburing, ls-hpack (HPACK, RFC 7541), picohttpparser. `--tls` needs one
+more thing that is NOT a submodule: mruby-ktls and the OpenSSL it built.
+See "TLS, through the kernel" below.
 
 liburing is vendored rather than taken from the distro on purpose — the
 system copy is routinely older than the ring features this tool exists to
@@ -143,12 +149,42 @@ use. Debian trixie ships 2.5; send/recv bundles arrived in 2.6. Build
 with `USE_SYSTEM_URING=1` to use the system copy anyway; the two places
 that need bundles are guarded, and the run says on startup what it lost.
 
+## TLS, through the kernel
+
+`--tls` measures an encrypted connection without a record layer in this
+process. The handshake runs once per connection, before the ring sees
+the descriptor: blocking reads and writes, keys agreed with
+[mruby-ktls](https://github.com/Asmod4n/mruby-ktls)'s C library, and
+then `setsockopt(TLS_TX | TLS_RX)`. From there the KERNEL encrypts, so
+every send and recv in the measured loop is the same code as without
+TLS — no copy through an encryption buffer, and the numbers stay
+comparable.
+
+It is off unless the build says otherwise, because the library needs an
+OpenSSL that was built WITH kTLS and a distribution's usually was not
+(Ubuntu's `libssl.so.3` exports no ktls symbol). mruby-ktls builds one
+and keeps it:
+
+```
+make KTLS=~/mruby-ktls OPENSSL=~/mruby-ktls/build/openssl
+```
+
+Two things this arrangement means, and they belong in any number it
+produces:
+
+* The peer is not verified. `ktls_keys_client` carries no trust store —
+  this is a load generator pointed at a machine you own.
+* A socket the kernel owns answers **EIO** on `recv(2)` for any record
+  that is not application data. The tickets a server writes right after
+  its Finished are drained before the handover; a KeyUpdate in the
+  middle of a run ends that connection and is counted in `bad`.
+
 ## What it does not do yet
 
 Request content larger than one HTTP/2 stream window (16 KiB), which
 would need WINDOW_UPDATE handling. Trailers. Several URLs in one run.
-TLS — and that one is unlikely to arrive here, because measuring a TLS
-handshake is a different tool's job.
+TLS on a unix socket — the kernel's record layer is a TCP ULP, so
+`setsockopt(TCP_ULP, "tls")` there is ENOTSUP.
 
 ## License
 

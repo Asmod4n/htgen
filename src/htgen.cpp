@@ -10,6 +10,7 @@
 //   htgen --sock PATH [--conns N] [--seconds S] [--path P] [--host H]
 //   htgen --host 127.0.0.1 --port 8123 [...]
 //   htgen --sock PATH --h2 [--streams M]
+//   htgen --host H --port 443 --tls [--h2]
 //
 // The h2 half speaks RFC 9113 with prior knowledge (3.4, no upgrade
 // dance). The frame layer is h2_wire.hpp next door; what lives here is
@@ -21,6 +22,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -35,6 +37,14 @@
 #include <string_view>
 #include <vector>
 #include <utility>
+
+#ifdef HTGEN_TLS
+// kTLS, and the whole of TLS this file knows: the handshake happens
+// once per connection BEFORE the ring sees the descriptor, and after
+// the handover the kernel is the record layer. So every send and recv
+// below is unchanged - they are TLS records because the socket is.
+#include "ktls.h"
+#endif
 
 #include "liburing.h"
 
@@ -874,6 +884,111 @@ int connect_tcp(const char* host, int port) {
   return fd;
 }
 
+
+#ifdef HTGEN_TLS
+// RFC 8446 and then out of the way. The keys are agreed on the plain
+// descriptor with blocking reads and writes, the kernel is handed the
+// two crypto_info blobs, and the descriptor goes to the ring exactly as
+// it was. Nothing here is measured: the run starts after every
+// connection stands.
+//
+// TWO THINGS A BENCH MUST KNOW about a socket the kernel owns:
+//
+//  - recv(2) answers EIO for any record that is not application data.
+//    htgen reads with plain recv, so a NewSessionTicket or a KeyUpdate
+//    that arrives DURING the run ends that connection. A server writes
+//    its tickets right after Finished, so they are drained below,
+//    before the handover; a KeyUpdate mid-run is a limitation and is
+//    counted as a broken connection, not hidden.
+//  - the kernel's stream starts at record sequence zero and takes no
+//    backlog. Anything the peer already sent must come out of the
+//    exchange first - and nothing was asked for yet, so a non-empty
+//    backlog is a refusal rather than something to buffer.
+bool tls_offload(int fd, ktls_keys* keys, const char* alpn_want) {
+  ktls_exchange* x = ktls_exchange_open(keys, KTLS_CLIENT);
+  if (x == nullptr) {
+    std::fprintf(stderr, "htgen: tls open: %s\n", ktls_last_error());
+    return false;
+  }
+  unsigned char buf[16384];
+  const auto give_up = [&](const char* what) {
+    std::fprintf(stderr, "htgen: tls %s: %s\n", what, ktls_last_error());
+    ktls_exchange_free(x);
+    return false;
+  };
+  // Take is drained after EVERY step, including one that answers
+  // READING: a step may owe bytes and want more in the same breath.
+  const auto flush = [&]() -> bool {
+    for (;;) {
+      const size_t n = ktls_exchange_take(x, buf, sizeof(buf));
+      if (n == 0) return true;
+      size_t off = 0;
+      while (off < n) {
+        const ssize_t w = ::send(fd, buf + off, n - off, MSG_NOSIGNAL);
+        if (w <= 0) return false;
+        off += static_cast<size_t>(w);
+      }
+    }
+  };
+  ktls_step step = KTLS_READING;
+  for (int round = 0; round < 64 && step != KTLS_DONE; round++) {
+    if (ktls_exchange_step(x, &step) != 0) return give_up("step");
+    if (!flush()) return give_up("send");
+    if (step == KTLS_READING) {
+      const ssize_t r = ::recv(fd, buf, sizeof(buf), 0);
+      if (r <= 0) {
+        std::fprintf(stderr, "htgen: tls read: %s\n", r == 0 ? "peer hung up" : std::strerror(errno));
+        ktls_exchange_free(x);
+        return false;
+      }
+      if (ktls_exchange_feed(x, buf, static_cast<size_t>(r)) != 0) return give_up("feed");
+    }
+  }
+  if (step != KTLS_DONE) {
+    std::fprintf(stderr, "htgen: tls handshake did not finish in 64 rounds\n");
+    ktls_exchange_free(x);
+    return false;
+  }
+  if (alpn_want != nullptr) {
+    size_t alen = 0;
+    const char* got = ktls_exchange_alpn(x, &alen);
+    if (got == nullptr || alen != std::strlen(alpn_want) ||
+        std::memcmp(got, alpn_want, alen) != 0) {
+      std::fprintf(stderr, "htgen: the peer did not take ALPN %s (it named %.*s)\n", alpn_want,
+                   got == nullptr ? 4 : static_cast<int>(alen), got == nullptr ? "none" : got);
+      ktls_exchange_free(x);
+      return false;
+    }
+  }
+  // The tickets. They are already on the wire or they are moments away,
+  // so this waits once and only briefly - and a server that sends none
+  // costs exactly that one wait.
+  for (int quiet = 0; quiet < 2;) {
+    struct pollfd pfd { fd, POLLIN, 0 };
+    const int ready = ::poll(&pfd, 1, 50);
+    if (ready <= 0) { quiet++; continue; }
+    quiet = 0;
+    const ssize_t r = ::recv(fd, buf, sizeof(buf), 0);
+    if (r <= 0) break;
+    if (ktls_exchange_feed(x, buf, static_cast<size_t>(r)) != 0) return give_up("feed");
+    unsigned char plain[16384];
+    const size_t left = ktls_exchange_backlog(x, plain, sizeof(plain));
+    if (left != 0) {
+      std::fprintf(stderr, "htgen: the peer sent %zu bytes before anything was asked for\n", left);
+      ktls_exchange_free(x);
+      return false;
+    }
+  }
+  if (ktls_offload(x, fd) != 0) {
+    std::fprintf(stderr, "htgen: tls handover: %s\n", ktls_last_error());
+    ktls_exchange_free(x);
+    return false;
+  }
+  ktls_exchange_free(x);
+  return true;
+}
+#endif
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -895,6 +1010,7 @@ int main(int argc, char** argv) {
   Span extra_val[32];
   size_t nextra = 0;
   bool h2 = false;
+  bool tls = false;
   double seconds = 5.0;
   for (int i = 1; i < argc; i++) {
     const auto next = [&]() -> const char* { return i + 1 < argc ? argv[++i] : nullptr; };
@@ -906,6 +1022,7 @@ int main(int argc, char** argv) {
     else if (std::strcmp(argv[i], "--path") == 0) path = next();
     else if (std::strcmp(argv[i], "--host-header") == 0) hdr_host = next();
     else if (std::strcmp(argv[i], "--h2") == 0) h2 = true;
+    else if (std::strcmp(argv[i], "--tls") == 0) tls = true;
     else if (std::strcmp(argv[i], "--streams") == 0) streams = std::atoi(next());
     else if (std::strcmp(argv[i], "--pipeline") == 0) pipeline = std::atoi(next());
     else if (std::strcmp(argv[i], "--method") == 0) method = next();
@@ -945,6 +1062,13 @@ int main(int argc, char** argv) {
   }
   if ((sock == nullptr) == (host == nullptr)) {
     std::fprintf(stderr, "htgen: exactly one of --sock PATH or --host H --port P\n");
+    return 2;
+  }
+  // The kernel's record layer is a TCP ULP: setsockopt(TCP_ULP, "tls")
+  // on AF_UNIX is ENOTSUP. TLS over a unix socket needs a record layer
+  // in this process, and htgen has none.
+  if (tls && sock != nullptr) {
+    std::fprintf(stderr, "htgen: --tls needs --host and --port; the tls ULP is TCP's\n");
     return 2;
   }
   if (conns <= 0 || conns > 4096) {
@@ -1112,6 +1236,34 @@ int main(int argc, char** argv) {
       cursor += carry_cap;
     }
   }
+#ifdef HTGEN_TLS
+  // One config for the whole run, as a listener has one: it holds the
+  // suite order and the ALPN this client offers, and every exchange is
+  // opened from it.
+  ktls_keys* tls_keys = nullptr;
+  if (tls) {
+    tls_keys = ktls_keys_client();
+    if (tls_keys == nullptr) {
+      std::fprintf(stderr, "htgen: tls keys: %s\n", ktls_last_error());
+      return 1;
+    }
+    // ALPN is how the peer learns which protocol these frames are, and
+    // over TLS it is the ONLY way: there is no prior knowledge to fall
+    // back on and no upgrade dance. One name, because a bench measures
+    // the protocol it was asked for.
+    const char* const offered[1] = {h2 ? "h2" : "http/1.1"};
+    if (ktls_keys_set_alpn(tls_keys, offered, 1) != 0) {
+      std::fprintf(stderr, "htgen: tls alpn: %s\n", ktls_last_error());
+      return 1;
+    }
+  }
+#else
+  if (tls) {
+    std::fprintf(stderr, "htgen: this build has no TLS - rebuild with:\n");
+    std::fprintf(stderr, "  make KTLS=/path/to/mruby-ktls OPENSSL=/path/to/openssl\n");
+    return 2;
+  }
+#endif
   for (int i = 0; i < conns; i++) {
     const int fd = sock != nullptr ? connect_unix(sock) : connect_tcp(host, port);
     if (fd < 0) {
@@ -1119,6 +1271,12 @@ int main(int argc, char** argv) {
                    std::strerror(errno));
       return 1;
     }
+#ifdef HTGEN_TLS
+    if (tls && !tls_offload(fd, tls_keys, h2 ? "h2" : "http/1.1")) {
+      std::fprintf(stderr, "htgen: tls %d/%d failed\n", i + 1, conns);
+      return 1;
+    }
+#endif
     run.conns[static_cast<size_t>(i)].fd = fd;
     run.fds[static_cast<size_t>(i)] = fd;
   }
@@ -1223,13 +1381,13 @@ int main(int argc, char** argv) {
 
   std::printf(
       "responses=%llu bad=%llu seconds=%.3f rps=%.0f bytes=%llu MB/s=%.2f conns=%d "
-      "streams=%d pipeline=%d method=%s proto=%s bundles=%d bufs=%d/%d enobufs=%llu "
+      "streams=%d pipeline=%d method=%s proto=%s tls=%d bundles=%d bufs=%d/%d enobufs=%llu "
       "rearms=%llu tx_bytes=%llu tx_MB/s=%.2f\n",
       static_cast<unsigned long long>(run.responses), static_cast<unsigned long long>(run.bad),
       elapsed, static_cast<double>(run.responses) / elapsed,
       static_cast<unsigned long long>(run.rx_bytes),
       static_cast<double>(run.rx_bytes) / elapsed / (1024.0 * 1024.0), conns, streams, pipeline,
-      method, h2 ? "h2" : "h1",
+      method, h2 ? "h2" : "h1", tls ? 1 : 0,
       run.bundles ? 1 : 0, bufs, buf_size,
       static_cast<unsigned long long>(run.enobufs),
       static_cast<unsigned long long>(run.rearms),
