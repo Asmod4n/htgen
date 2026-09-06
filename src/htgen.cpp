@@ -991,6 +991,12 @@ bool tls_offload(int fd, ktls_keys* keys, const char* alpn_want) {
 
 }  // namespace
 
+// Which commit this binary was built from. The Makefile bakes it in; a
+// build without it says so rather than inventing a version.
+#ifndef HTGEN_COMMIT
+#define HTGEN_COMMIT "unknown"
+#endif
+
 int main(int argc, char** argv) {
   const char* sock = nullptr;
   const char* host = nullptr;
@@ -1014,7 +1020,11 @@ int main(int argc, char** argv) {
   double seconds = 5.0;
   for (int i = 1; i < argc; i++) {
     const auto next = [&]() -> const char* { return i + 1 < argc ? argv[++i] : nullptr; };
-    if (std::strcmp(argv[i], "--sock") == 0) sock = next();
+    if (std::strcmp(argv[i], "--version") == 0) {
+      std::printf("%s\n", HTGEN_COMMIT);
+      return 0;
+    }
+    else if (std::strcmp(argv[i], "--sock") == 0) sock = next();
     else if (std::strcmp(argv[i], "--host") == 0) host = next();
     else if (std::strcmp(argv[i], "--port") == 0) port = std::atoi(next());
     else if (std::strcmp(argv[i], "--conns") == 0) conns = std::atoi(next());

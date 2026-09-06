@@ -24,6 +24,13 @@ CXX      ?= c++
 CC       ?= cc
 OPT      ?= -O3 -march=native
 CXXFLAGS ?= $(OPT) -std=c++20 -Wall -Wextra
+
+# Which commit this binary is, baked in. A build date says when somebody
+# typed make, which is not a version: two builds of the same commit have
+# two dates, and that is how a bench came to compare a client with
+# itself and read the difference as the server's. `-dirty` when the tree
+# had uncommitted changes.
+COMMIT := $(shell git -C $(dir $(firstword $(MAKEFILE_LIST))) describe --always --dirty --abbrev=8 2>/dev/null || echo unknown)
 CFLAGS   ?= $(OPT) -std=gnu99 -Wall
 
 HPACK    := deps/ls-hpack
@@ -92,7 +99,7 @@ build:
 	@mkdir -p build
 
 build/htgen.o: src/htgen.cpp src/h2_wire.hpp $(URING_DEP) | build $(HPACK)/lshpack.h
-	$(CXX) $(CXXFLAGS) $(INCLUDES) $(URING_CFLAGS) $(TLS_CFLAGS) -c $< -o $@
+	$(CXX) $(CXXFLAGS) $(INCLUDES) $(URING_CFLAGS) $(TLS_CFLAGS) -DHTGEN_COMMIT='"$(COMMIT)"' -c $< -o $@
 
 # The C dependencies are C. Feeding lshpack.c to a C++ compiler fails on
 # its designated initialisers and its implicit void* conversions - the
