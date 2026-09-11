@@ -1,6 +1,7 @@
 [submodule "deps/ls-hpack"]
 	path = deps/ls-hpack
-	url = https://github.com/litespeedtech/ls-hpack
+	url = https://github.com/Asmod4n/ls-hpack
+	branch = fix-undefined-behaviour
 [submodule "deps/picohttpparser"]
 	path = deps/picohttpparser
 	url = https://github.com/h2o/picohttpparser
