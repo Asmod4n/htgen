@@ -7,7 +7,7 @@
 // kernel offers them, one ring enter carrying hundreds of completions,
 // and one outstanding request per connection unless asked for more.
 //
-//   htgen --sock PATH [--conns N] [--seconds S] [--path P] [--host H]
+//   htgen --sock PATH [--conns N] [--threads N] [--seconds S] [--path P] [--host H]
 //   htgen --host 127.0.0.1 --port 8123 [...]
 //   htgen --sock PATH --h2 [--streams M]
 //   htgen --host H --port 443 --tls [--h2]
@@ -35,6 +35,7 @@
 #include <ctime>
 #include <memory>
 #include <string_view>
+#include <thread>
 #include <vector>
 #include <utility>
 
@@ -1004,6 +1005,7 @@ int main(int argc, char** argv) {
   const char* path = "/";
   int port = 0;
   int conns = 64;
+  int threads = 1;
   int streams = 1;
   int pipeline = 1;
   const char* method = "GET";
@@ -1028,6 +1030,7 @@ int main(int argc, char** argv) {
     else if (std::strcmp(argv[i], "--host") == 0) host = next();
     else if (std::strcmp(argv[i], "--port") == 0) port = std::atoi(next());
     else if (std::strcmp(argv[i], "--conns") == 0) conns = std::atoi(next());
+    else if (std::strcmp(argv[i], "--threads") == 0) threads = std::atoi(next());
     else if (std::strcmp(argv[i], "--seconds") == 0) seconds = std::atof(next());
     else if (std::strcmp(argv[i], "--path") == 0) path = next();
     else if (std::strcmp(argv[i], "--host-header") == 0) hdr_host = next();
@@ -1083,6 +1086,19 @@ int main(int argc, char** argv) {
   }
   if (conns <= 0 || conns > 4096) {
     std::fprintf(stderr, "htgen: --conns must be 1..4096\n");
+    return 2;
+  }
+  if (threads < 1 || threads > 256) {
+    std::fprintf(stderr, "htgen: --threads must be 1..256\n");
+    return 2;
+  }
+  // A thread with no connection measures nothing and would still take a
+  // ring and a core. The count is refused rather than rounded down: a
+  // run that quietly used fewer threads than it was asked for reports a
+  // number under a shape nobody chose.
+  if (threads > conns) {
+    std::fprintf(stderr, "htgen: --threads %d over --conns %d: a thread needs a connection\n",
+                 threads, conns);
     return 2;
   }
   if (streams < 1 || streams > 1024) {
@@ -1163,240 +1179,283 @@ int main(int argc, char** argv) {
     return 2;
   }
 
-  Run run;
-  run.h2 = h2;
-  run.streams = static_cast<uint32_t>(streams);
-  run.path = Span(path, std::strlen(path));
-  run.authority = Span(hdr_host, std::strlen(hdr_host));
-  run.pipeline = static_cast<uint32_t>(pipeline);
-  for (size_t k = 0; k < nextra; k++) {
-    run.header_name[k] = extra_name[k];
-    run.header_val[k] = extra_val[k];
-  }
-  run.nheaders = nextra;
-  run.method = Span(method, std::strlen(method));
-  run.body = body;
-  run.latency = latency;
-  run.buf_count = static_cast<unsigned>(bufs);
-  run.buf_size = static_cast<unsigned>(buf_size);
-
-  // ONE block, carved once, for every per-connection wire buffer. After
-  // this line the request path does not touch the allocator again: the
-  // sizes are what the SHAPE of the run needs, so a buffer that would
-  // overflow is a wrong size here rather than a realloc in the middle
-  // of a measurement.
-  const size_t one_req = 64 + std::strlen(path) + std::strlen(hdr_host) + body.size() +
-                         32 * 256;
-  const size_t out_cap = h2 ? (64 + static_cast<size_t>(streams) * (one_req + 32))
-                            : (64 + static_cast<size_t>(pipeline) * one_req);
-  const size_t carry_cap = kH2MaxFrameSize + kH2FrameHeaderLen;
-  const size_t frag_cap = 64 * 1024;
-  const size_t hdrbuf_cap = 64 * 1024;
-  const size_t blk_cap = 1024;
-  const size_t per_conn = 2 * out_cap + (h2 ? carry_cap + frag_cap + hdrbuf_cap + blk_cap
-                                            : carry_cap);
-  const size_t lat_bytes = latency ? Latency::kBuckets * sizeof(uint64_t) : 0;
-  char* block = static_cast<char*>(std::calloc(1, per_conn * static_cast<size_t>(conns) +
-                                                  out_cap + lat_bytes));
-  if (block == nullptr) {
-    std::fprintf(stderr, "htgen: cannot reserve %zu bytes of wire buffers\n",
-                 per_conn * static_cast<size_t>(conns));
-    return 1;
-  }
-  char* cursor = block;
-  run.request.bind(cursor, out_cap);
-  cursor += out_cap;
-  if (latency) {
-    run.lat.bind(reinterpret_cast<uint64_t*>(cursor));
-    cursor += lat_bytes;
-  }
-  run.request.assign(run.method.data(), run.method.size());
-  run.request.append(" ", 1);
-  run.request.append(path, std::strlen(path));
-  run.request.append(" HTTP/1.1\r\nHost: ", 17);
-  run.request.append(hdr_host, std::strlen(hdr_host));
-  for (size_t k = 0; k < run.nheaders; k++) {
-    run.request.append("\r\n", 2);
-    run.request.append(run.header_name[k].data(), run.header_name[k].size());
-    run.request.append(": ", 2);
-    run.request.append(run.header_val[k].data(), run.header_val[k].size());
-  }
-  // RFC 9110 8.6: content is announced, always - a request without a
-  // Content-Length and without chunked has no content at all, and a
-  // server is right to answer 411 or read the next request out of the
-  // body. Sent even for an empty --body, because "0" is an answer.
-  if (!run.body.empty()) {
-    char cl[32];
-    const int cln = std::snprintf(cl, sizeof(cl), "\r\nContent-Length: %zu", run.body.size());
-    run.request.append(cl, static_cast<size_t>(cln));
-  }
-  run.request.append("\r\n\r\n", 4);
-  if (!run.body.empty()) run.request.append(run.body.data(), run.body.size());
-  run.conns.resize(static_cast<size_t>(conns));
-  run.fds.resize(static_cast<size_t>(conns));
-  for (int i = 0; i < conns; i++) {
-    Conn& cc = run.conns[static_cast<size_t>(i)];
-    cc.out.bind(cursor, out_cap);   cursor += out_cap;
-    cc.wire.bind(cursor, out_cap);  cursor += out_cap;
-    if (h2) {
-      cc.h2_mem = cursor;
-      cursor += carry_cap + frag_cap + hdrbuf_cap + blk_cap;
-    } else {
-      cc.carry.bind(cursor, carry_cap);
-      cursor += carry_cap;
+  // One thread of the run. It holds its own ring, its own share of the
+  // connections and its own counters, and it touches nothing another
+  // thread holds - so there is no lock anywhere below and no false
+  // sharing to reason about. main adds the counters up once, after the
+  // last thread joined.
+  const auto one_thread = [&](int conns, int64_t deadline, Run& run) -> int {
+    run.h2 = h2;
+    run.streams = static_cast<uint32_t>(streams);
+    run.path = Span(path, std::strlen(path));
+    run.authority = Span(hdr_host, std::strlen(hdr_host));
+    run.pipeline = static_cast<uint32_t>(pipeline);
+    for (size_t k = 0; k < nextra; k++) {
+      run.header_name[k] = extra_name[k];
+      run.header_val[k] = extra_val[k];
     }
-  }
-#ifdef HTGEN_TLS
-  // One config for the whole run, as a listener has one: it holds the
-  // suite order and the ALPN this client offers, and every exchange is
-  // opened from it.
-  ktls_keys* tls_keys = nullptr;
-  if (tls) {
-    tls_keys = ktls_keys_client();
-    if (tls_keys == nullptr) {
-      std::fprintf(stderr, "htgen: tls keys: %s\n", ktls_last_error());
+    run.nheaders = nextra;
+    run.method = Span(method, std::strlen(method));
+    run.body = body;
+    run.latency = latency;
+    run.buf_count = static_cast<unsigned>(bufs);
+    run.buf_size = static_cast<unsigned>(buf_size);
+
+    // ONE block, carved once, for every per-connection wire buffer. After
+    // this line the request path does not touch the allocator again: the
+    // sizes are what the SHAPE of the run needs, so a buffer that would
+    // overflow is a wrong size here rather than a realloc in the middle
+    // of a measurement.
+    const size_t one_req = 64 + std::strlen(path) + std::strlen(hdr_host) + body.size() +
+                           32 * 256;
+    const size_t out_cap = h2 ? (64 + static_cast<size_t>(streams) * (one_req + 32))
+                              : (64 + static_cast<size_t>(pipeline) * one_req);
+    const size_t carry_cap = kH2MaxFrameSize + kH2FrameHeaderLen;
+    const size_t frag_cap = 64 * 1024;
+    const size_t hdrbuf_cap = 64 * 1024;
+    const size_t blk_cap = 1024;
+    const size_t per_conn = 2 * out_cap + (h2 ? carry_cap + frag_cap + hdrbuf_cap + blk_cap
+                                              : carry_cap);
+    const size_t lat_bytes = latency ? Latency::kBuckets * sizeof(uint64_t) : 0;
+    char* block = static_cast<char*>(std::calloc(1, per_conn * static_cast<size_t>(conns) +
+                                                    out_cap + lat_bytes));
+    if (block == nullptr) {
+      std::fprintf(stderr, "htgen: cannot reserve %zu bytes of wire buffers\n",
+                   per_conn * static_cast<size_t>(conns));
       return 1;
     }
-    // ALPN is how the peer learns which protocol these frames are, and
-    // over TLS it is the ONLY way: there is no prior knowledge to fall
-    // back on and no upgrade dance. One name, because a bench measures
-    // the protocol it was asked for.
-    const char* const offered[1] = {h2 ? "h2" : "http/1.1"};
-    if (ktls_keys_set_alpn(tls_keys, offered, 1) != 0) {
-      std::fprintf(stderr, "htgen: tls alpn: %s\n", ktls_last_error());
+    char* cursor = block;
+    run.request.bind(cursor, out_cap);
+    cursor += out_cap;
+    if (latency) {
+      run.lat.bind(reinterpret_cast<uint64_t*>(cursor));
+      cursor += lat_bytes;
+    }
+    run.request.assign(run.method.data(), run.method.size());
+    run.request.append(" ", 1);
+    run.request.append(path, std::strlen(path));
+    run.request.append(" HTTP/1.1\r\nHost: ", 17);
+    run.request.append(hdr_host, std::strlen(hdr_host));
+    for (size_t k = 0; k < run.nheaders; k++) {
+      run.request.append("\r\n", 2);
+      run.request.append(run.header_name[k].data(), run.header_name[k].size());
+      run.request.append(": ", 2);
+      run.request.append(run.header_val[k].data(), run.header_val[k].size());
+    }
+    // RFC 9110 8.6: content is announced, always - a request without a
+    // Content-Length and without chunked has no content at all, and a
+    // server is right to answer 411 or read the next request out of the
+    // body. Sent even for an empty --body, because "0" is an answer.
+    if (!run.body.empty()) {
+      char cl[32];
+      const int cln = std::snprintf(cl, sizeof(cl), "\r\nContent-Length: %zu", run.body.size());
+      run.request.append(cl, static_cast<size_t>(cln));
+    }
+    run.request.append("\r\n\r\n", 4);
+    if (!run.body.empty()) run.request.append(run.body.data(), run.body.size());
+    run.conns.resize(static_cast<size_t>(conns));
+    run.fds.resize(static_cast<size_t>(conns));
+    for (int i = 0; i < conns; i++) {
+      Conn& cc = run.conns[static_cast<size_t>(i)];
+      cc.out.bind(cursor, out_cap);   cursor += out_cap;
+      cc.wire.bind(cursor, out_cap);  cursor += out_cap;
+      if (h2) {
+        cc.h2_mem = cursor;
+        cursor += carry_cap + frag_cap + hdrbuf_cap + blk_cap;
+      } else {
+        cc.carry.bind(cursor, carry_cap);
+        cursor += carry_cap;
+      }
+    }
+  #ifdef HTGEN_TLS
+    // One config for the whole run, as a listener has one: it holds the
+    // suite order and the ALPN this client offers, and every exchange is
+    // opened from it.
+    ktls_keys* tls_keys = nullptr;
+    if (tls) {
+      tls_keys = ktls_keys_client();
+      if (tls_keys == nullptr) {
+        std::fprintf(stderr, "htgen: tls keys: %s\n", ktls_last_error());
+        return 1;
+      }
+      // ALPN is how the peer learns which protocol these frames are, and
+      // over TLS it is the ONLY way: there is no prior knowledge to fall
+      // back on and no upgrade dance. One name, because a bench measures
+      // the protocol it was asked for.
+      const char* const offered[1] = {h2 ? "h2" : "http/1.1"};
+      if (ktls_keys_set_alpn(tls_keys, offered, 1) != 0) {
+        std::fprintf(stderr, "htgen: tls alpn: %s\n", ktls_last_error());
+        return 1;
+      }
+    }
+  #else
+    if (tls) {
+      std::fprintf(stderr, "htgen: this build has no TLS - rebuild with:\n");
+      std::fprintf(stderr, "  make KTLS=/path/to/mruby-ktls OPENSSL=/path/to/openssl\n");
+      return 2;
+    }
+  #endif
+    for (int i = 0; i < conns; i++) {
+      const int fd = sock != nullptr ? connect_unix(sock) : connect_tcp(host, port);
+      if (fd < 0) {
+        std::fprintf(stderr, "htgen: connect %d/%d failed: %s\n", i + 1, conns,
+                     std::strerror(errno));
+        return 1;
+      }
+  #ifdef HTGEN_TLS
+      if (tls && !tls_offload(fd, tls_keys, h2 ? "h2" : "http/1.1")) {
+        std::fprintf(stderr, "htgen: tls %d/%d failed\n", i + 1, conns);
+        return 1;
+      }
+  #endif
+      run.conns[static_cast<size_t>(i)].fd = fd;
+      run.fds[static_cast<size_t>(i)] = fd;
+    }
+
+    struct io_uring_params p {};
+    p.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN | IORING_SETUP_COOP_TASKRUN;
+    int rc = io_uring_queue_init_params(kSqEntries, &run.ring, &p);
+    if (rc != 0) {
+      std::fprintf(stderr, "htgen: queue_init: %s\n", std::strerror(-rc));
       return 1;
     }
-  }
-#else
-  if (tls) {
-    std::fprintf(stderr, "htgen: this build has no TLS - rebuild with:\n");
-    std::fprintf(stderr, "  make KTLS=/path/to/mruby-ktls OPENSSL=/path/to/openssl\n");
-    return 2;
-  }
-#endif
-  for (int i = 0; i < conns; i++) {
-    const int fd = sock != nullptr ? connect_unix(sock) : connect_tcp(host, port);
-    if (fd < 0) {
-      std::fprintf(stderr, "htgen: connect %d/%d failed: %s\n", i + 1, conns,
-                   std::strerror(errno));
+    io_uring_register_ring_fd(&run.ring);
+    rc = io_uring_register_files(&run.ring, run.fds.data(), static_cast<unsigned>(conns));
+    if (rc != 0) {
+      std::fprintf(stderr, "htgen: register_files: %s\n", std::strerror(-rc));
       return 1;
     }
-#ifdef HTGEN_TLS
-    if (tls && !tls_offload(fd, tls_keys, h2 ? "h2" : "http/1.1")) {
-      std::fprintf(stderr, "htgen: tls %d/%d failed\n", i + 1, conns);
+    void* mem = ::mmap(nullptr, static_cast<size_t>(run.buf_count) * run.buf_size,
+                       PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mem == MAP_FAILED) {
+      std::fprintf(stderr, "htgen: mmap pool: %s\n", std::strerror(errno));
       return 1;
     }
-#endif
-    run.conns[static_cast<size_t>(i)].fd = fd;
-    run.fds[static_cast<size_t>(i)] = fd;
-  }
-
-  struct io_uring_params p {};
-  p.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN | IORING_SETUP_COOP_TASKRUN;
-  int rc = io_uring_queue_init_params(kSqEntries, &run.ring, &p);
-  if (rc != 0) {
-    std::fprintf(stderr, "htgen: queue_init: %s\n", std::strerror(-rc));
-    return 1;
-  }
-  io_uring_register_ring_fd(&run.ring);
-  rc = io_uring_register_files(&run.ring, run.fds.data(), static_cast<unsigned>(conns));
-  if (rc != 0) {
-    std::fprintf(stderr, "htgen: register_files: %s\n", std::strerror(-rc));
-    return 1;
-  }
-  void* mem = ::mmap(nullptr, static_cast<size_t>(run.buf_count) * run.buf_size,
-                     PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  if (mem == MAP_FAILED) {
-    std::fprintf(stderr, "htgen: mmap pool: %s\n", std::strerror(errno));
-    return 1;
-  }
-  run.pool = static_cast<char*>(mem);
-  int bre = 0;
-  run.br = io_uring_setup_buf_ring(&run.ring, run.buf_count, kBufGroup, 0, &bre);
-  if (run.br == nullptr) {
-    std::fprintf(stderr, "htgen: setup_buf_ring: %s\n", std::strerror(-bre));
-    return 1;
-  }
-  const int mask = io_uring_buf_ring_mask(run.buf_count);
-  for (uint32_t i = 0; i < run.buf_count; i++) {
-    io_uring_buf_ring_add(run.br, run.pool + static_cast<size_t>(i) * run.buf_size,
-                          run.buf_size,
-                          static_cast<uint16_t>(i), mask, static_cast<int>(i));
-  }
-  io_uring_buf_ring_advance(run.br, static_cast<int>(run.buf_count));
-  // RFC-free, kernel ABI: one recv completion may carry several buffers
-  // instead of one. Needs liburing 2.6 and a kernel that answers with the
-  // feature bit; built against an older header the whole idea is absent,
-  // and the run says so rather than silently costing a syscall per buffer.
-#ifdef IORING_FEAT_RECVSEND_BUNDLE
-  run.bundles = (run.ring.features & IORING_FEAT_RECVSEND_BUNDLE) != 0;
-#else
-  run.bundles = false;
-  std::fprintf(stderr, "htgen: built against a liburing without send/recv bundles - "
-                       "one completion per buffer\n");
-#endif
-  if (const char* e = std::getenv("HTGEN_BUNDLE")) {
-    if (e[0] == '0') run.bundles = false;
-  }
-
-  for (int i = 0; i < conns; i++) {
-    const uint32_t idx = static_cast<uint32_t>(i);
-    run.arm_recv(idx);
-    if (h2) {
-      run.h2_open(idx);
-      run.h2_fill(idx);
-    } else {
-      // RFC 9112 9.3.2: pipelining is depth requests on the wire at once.
-      // The primer puts `pipeline` of them out; each completion below
-      // appends exactly one, so the depth holds for the whole run.
-      for (uint32_t d = 0; d < run.pipeline; d++) run.conns[idx].out.append(run.request);
+    run.pool = static_cast<char*>(mem);
+    int bre = 0;
+    run.br = io_uring_setup_buf_ring(&run.ring, run.buf_count, kBufGroup, 0, &bre);
+    if (run.br == nullptr) {
+      std::fprintf(stderr, "htgen: setup_buf_ring: %s\n", std::strerror(-bre));
+      return 1;
     }
-    run.conns[idx].queued = false;
-    run.arm_send(idx);
-  }
-  run.to_send.clear();
-
-  const int64_t t0 = now_ns();
-  const int64_t deadline = t0 + static_cast<int64_t>(seconds * 1e9);
-  for (;;) {
-    const int64_t left = deadline - now_ns();
-    if (left <= 0) break;
-    struct __kernel_timespec ts {left / 1000000000, left % 1000000000};
-    struct io_uring_cqe* first = nullptr;
-    io_uring_submit_and_wait_timeout(&run.ring, &first, 1, &ts, nullptr);
-
-    unsigned head = 0;
-    struct io_uring_cqe* cqe = nullptr;
-    unsigned seen = 0;
-    io_uring_for_each_cqe(&run.ring, head, cqe) {
-      const uint64_t d = io_uring_cqe_get_data64(cqe);
-      const uint8_t op = static_cast<uint8_t>(d >> 56);
-      const uint32_t idx = static_cast<uint32_t>(d & 0xffffffffu);
-      if (op == kOpRecv) run.on_recv(idx, cqe);
-      else if (op == kOpSend) run.on_send(idx, cqe);
-      seen++;
+    const int mask = io_uring_buf_ring_mask(run.buf_count);
+    for (uint32_t i = 0; i < run.buf_count; i++) {
+      io_uring_buf_ring_add(run.br, run.pool + static_cast<size_t>(i) * run.buf_size,
+                            run.buf_size,
+                            static_cast<uint16_t>(i), mask, static_cast<int>(i));
     }
-    io_uring_cq_advance(&run.ring, seen);
-    if (run.replenish != 0) {
-      io_uring_buf_ring_advance(run.br, static_cast<int>(run.replenish));
-      run.replenish = 0;
+    io_uring_buf_ring_advance(run.br, static_cast<int>(run.buf_count));
+    // RFC-free, kernel ABI: one recv completion may carry several buffers
+    // instead of one. Needs liburing 2.6 and a kernel that answers with the
+    // feature bit; built against an older header the whole idea is absent,
+    // and the run says so rather than silently costing a syscall per buffer.
+  #ifdef IORING_FEAT_RECVSEND_BUNDLE
+    run.bundles = (run.ring.features & IORING_FEAT_RECVSEND_BUNDLE) != 0;
+  #else
+    run.bundles = false;
+    std::fprintf(stderr, "htgen: built against a liburing without send/recv bundles - "
+                         "one completion per buffer\n");
+  #endif
+    if (const char* e = std::getenv("HTGEN_BUNDLE")) {
+      if (e[0] == '0') run.bundles = false;
     }
-    for (uint32_t idx : run.to_send) {
+
+    for (int i = 0; i < conns; i++) {
+      const uint32_t idx = static_cast<uint32_t>(i);
+      run.arm_recv(idx);
+      if (h2) {
+        run.h2_open(idx);
+        run.h2_fill(idx);
+      } else {
+        // RFC 9112 9.3.2: pipelining is depth requests on the wire at once.
+        // The primer puts `pipeline` of them out; each completion below
+        // appends exactly one, so the depth holds for the whole run.
+        for (uint32_t d = 0; d < run.pipeline; d++) run.conns[idx].out.append(run.request);
+      }
       run.conns[idx].queued = false;
       run.arm_send(idx);
     }
     run.to_send.clear();
+
+    for (;;) {
+      const int64_t left = deadline - now_ns();
+      if (left <= 0) break;
+      struct __kernel_timespec ts {left / 1000000000, left % 1000000000};
+      struct io_uring_cqe* first = nullptr;
+      io_uring_submit_and_wait_timeout(&run.ring, &first, 1, &ts, nullptr);
+
+      unsigned head = 0;
+      struct io_uring_cqe* cqe = nullptr;
+      unsigned seen = 0;
+      io_uring_for_each_cqe(&run.ring, head, cqe) {
+        const uint64_t d = io_uring_cqe_get_data64(cqe);
+        const uint8_t op = static_cast<uint8_t>(d >> 56);
+        const uint32_t idx = static_cast<uint32_t>(d & 0xffffffffu);
+        if (op == kOpRecv) run.on_recv(idx, cqe);
+        else if (op == kOpSend) run.on_send(idx, cqe);
+        seen++;
+      }
+      io_uring_cq_advance(&run.ring, seen);
+      if (run.replenish != 0) {
+        io_uring_buf_ring_advance(run.br, static_cast<int>(run.replenish));
+        run.replenish = 0;
+      }
+      for (uint32_t idx : run.to_send) {
+        run.conns[idx].queued = false;
+        run.arm_send(idx);
+      }
+      run.to_send.clear();
+    }
+    return 0;
+  };
+
+  // The connections go round the threads, so a remainder falls on the
+  // first ones rather than on the last. Every thread runs the same
+  // window: one deadline, taken here, and not one per thread.
+  std::vector<Run> runs(static_cast<size_t>(threads));
+  std::vector<int> failed(static_cast<size_t>(threads), 0);
+  std::vector<std::thread> crew;
+  const int64_t t0 = now_ns();
+  const int64_t deadline = t0 + static_cast<int64_t>(seconds * 1e9);
+  for (int t = 0; t < threads; t++) {
+    const int share = conns / threads + (t < conns % threads ? 1 : 0);
+    crew.emplace_back([&, t, share]() {
+      failed[static_cast<size_t>(t)] = one_thread(share, deadline, runs[static_cast<size_t>(t)]);
+    });
   }
+  for (std::thread& one : crew) one.join();
   const double elapsed = static_cast<double>(now_ns() - t0) / 1e9;
+  for (int t = 0; t < threads; t++) {
+    if (failed[static_cast<size_t>(t)] != 0) return failed[static_cast<size_t>(t)];
+  }
+
+  // The counters, added up. A rate is the whole run's, not a thread's.
+  Run& run = runs[0];
+  for (size_t t = 1; t < runs.size(); t++) {
+    const Run& other = runs[t];
+    run.responses += other.responses;
+    run.bad += other.bad;
+    run.rx_bytes += other.rx_bytes;
+    run.tx_bytes += other.tx_bytes;
+    run.enobufs += other.enobufs;
+    run.rearms += other.rearms;
+    if (run.latency) {
+      run.lat.n += other.lat.n;
+      run.lat.over += other.lat.over;
+      if (other.lat.max_us > run.lat.max_us) run.lat.max_us = other.lat.max_us;
+      for (uint32_t i = 0; i < Latency::kBuckets; i++) run.lat.us[i] += other.lat.us[i];
+    }
+  }
 
   std::printf(
       "responses=%llu bad=%llu seconds=%.3f rps=%.0f bytes=%llu MB/s=%.2f conns=%d "
-      "streams=%d pipeline=%d method=%s proto=%s tls=%d bundles=%d bufs=%d/%d enobufs=%llu "
-      "rearms=%llu tx_bytes=%llu tx_MB/s=%.2f\n",
+      "threads=%d streams=%d pipeline=%d method=%s proto=%s tls=%d bundles=%d bufs=%d/%d "
+      "enobufs=%llu rearms=%llu tx_bytes=%llu tx_MB/s=%.2f\n",
       static_cast<unsigned long long>(run.responses), static_cast<unsigned long long>(run.bad),
       elapsed, static_cast<double>(run.responses) / elapsed,
       static_cast<unsigned long long>(run.rx_bytes),
-      static_cast<double>(run.rx_bytes) / elapsed / (1024.0 * 1024.0), conns, streams, pipeline,
+      static_cast<double>(run.rx_bytes) / elapsed / (1024.0 * 1024.0), conns, threads, streams,
+      pipeline,
       method, h2 ? "h2" : "h1", tls ? 1 : 0,
       run.bundles ? 1 : 0, bufs, buf_size,
       static_cast<unsigned long long>(run.enobufs),
