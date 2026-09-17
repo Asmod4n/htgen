@@ -35,6 +35,7 @@
 #include <ctime>
 #include <memory>
 #include <string_view>
+#include <sys/resource.h>
 #include <thread>
 #include <vector>
 #include <utility>
@@ -1177,6 +1178,41 @@ int main(int argc, char** argv) {
   if (!h2 && streams != 1) {
     std::fprintf(stderr, "htgen: --streams needs --h2 - h1 has one request in flight\n");
     return 2;
+  }
+
+  // Every connection is a descriptor, and so is every thread's ring. A
+  // run that asks for more than the soft limit allows dies in the
+  // middle of connecting, with half its connections open and no number
+  // to show for it - so the limit is raised here, once, before anything
+  // is opened.
+  //
+  // The soft limit is the process's to raise, up to the hard one, and
+  // needs no privilege. Where the hard limit is the wall, the run stops
+  // and says both numbers: a bench that quietly measured fewer
+  // connections than it was asked for is worse than one that refuses.
+  {
+    const rlim_t want = static_cast<rlim_t>(conns) + static_cast<rlim_t>(threads) + 16;
+    struct rlimit have {};
+    if (::getrlimit(RLIMIT_NOFILE, &have) != 0) {
+      std::fprintf(stderr, "htgen: getrlimit(RLIMIT_NOFILE): %s\n", std::strerror(errno));
+      return 1;
+    }
+    if (have.rlim_cur < want) {
+      struct rlimit ask = have;
+      ask.rlim_cur = (have.rlim_max == RLIM_INFINITY || have.rlim_max > want) ? want
+                                                                             : have.rlim_max;
+      if (::setrlimit(RLIMIT_NOFILE, &ask) == 0) have.rlim_cur = ask.rlim_cur;
+    }
+    if (have.rlim_cur < want) {
+      std::fprintf(stderr,
+                   "htgen: %d connections over %d threads need %llu descriptors, and this "
+                   "process may open %llu (hard limit %llu). Raise the hard limit - "
+                   "ulimit -Hn, or LimitNOFILE= in a unit file - and run again.\n",
+                   conns, threads, static_cast<unsigned long long>(want),
+                   static_cast<unsigned long long>(have.rlim_cur),
+                   static_cast<unsigned long long>(have.rlim_max));
+      return 1;
+    }
   }
 
   // One thread of the run. It holds its own ring, its own share of the
